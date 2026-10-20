@@ -812,6 +812,48 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertEqual(len(reflection_candidates), 1)
         self.assertEqual(len(self.saved_reports), 1)
 
+    def test_fragment_variants_of_one_link_do_not_consume_duplicate_request_budget(self):
+        entry_url = "http://127.0.0.1/bWAPP/index.php"
+        first_page = "http://127.0.0.1/bWAPP/item.php?q=one#first"
+        second_page = "http://127.0.0.1/bWAPP/item.php?q=one#second"
+        probe_url = "http://127.0.0.1/bWAPP/item.php?q=JARVIS_TEST_12345#first"
+        first_target = requests.Request("GET", first_page).prepare().path_url
+        second_target = requests.Request("GET", second_page).prepare().path_url
+        self.assertEqual(first_target, second_target)
+
+        self.set_responses(
+            FakeResponse(
+                url=entry_url,
+                text=(
+                    '<a href="/bWAPP/item.php?q=one#first">first</a>'
+                    '<a href="/bWAPP/item.php?q=one#second">second</a>'
+                ),
+            ),
+            FakeResponse(url=first_page),
+            FakeResponse(url=probe_url, text="JARVIS_TEST_12345 reflected"),
+        )
+
+        self.run_audit(entry_url, active_checks=True, request_budget=3)
+
+        request_targets = [
+            requests.Request("GET", call[0]).prepare().path_url
+            for call in self.session.calls
+        ]
+        self.assertEqual(
+            request_targets,
+            [
+                "/bWAPP/index.php",
+                "/bWAPP/item.php?q=one",
+                "/bWAPP/item.php?q=JARVIS_TEST_12345",
+            ],
+        )
+        reflection_candidates = [
+            candidate for candidate in self.candidates
+            if candidate[0][1] == "Reflected Input"
+        ]
+        self.assertEqual(len(reflection_candidates), 1)
+        self.assertEqual(len(self.saved_reports), 1)
+
     def test_active_reflection_keeps_post_fields_inventory_only(self):
         response = FakeResponse(
             url="https://authorized.example/login.php",

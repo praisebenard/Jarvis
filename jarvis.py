@@ -894,6 +894,7 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
 def discover_links(response):
     text = response.text
     links = []
+    seen_request_urls = set()
     lower_text = text.lower()
     position = 0
 
@@ -925,7 +926,9 @@ def discover_links(response):
                     full_url = urljoin(base_url, href)
                     link_host = urlparse(full_url).hostname
 
-                    if full_url not in [item[1] for item in links]:
+                    request_url = full_url.split("#", 1)[0]
+                    if request_url not in seen_request_urls:
+                        seen_request_urls.add(request_url)
                         if link_host == base_host:
                             links.append(("LOCAL", full_url, href))
                         else:
