@@ -823,6 +823,28 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertTrue(any(target.startswith(linked_url.split("?", 1)[0]) for target in self.scope_checks))
         self.assertNotIn(linked_url, [call[0] for call in self.session.calls])
 
+    def test_scope_rejection_blocks_get_form_action_before_request(self):
+        entry_url = "http://127.0.0.1/bWAPP/index.php"
+        self.set_responses(FakeResponse(
+            url=entry_url,
+            text=(
+                '<form method="get" action="http://outside.example/search.php">'
+                '<input name="q"></form>'
+            ),
+        ))
+        self.namespace["check_scope"] = lambda candidate, **kwargs: (
+            self.scope_checks.append(candidate)
+            or "outside.example" not in candidate
+        )
+
+        self.run_audit(entry_url, active_checks=True, request_budget=2)
+
+        self.assertEqual([call[0] for call in self.session.calls], [entry_url])
+        self.assertIn(
+            "http://outside.example/search.php?q=JARVIS_TEST_12345",
+            self.scope_checks,
+        )
+
     def test_invalid_request_budgets_are_rejected_before_audit_requests(self):
         parse_options = self.namespace["_parse_audit_options"]
         self.assertEqual(parse_options("--active --request-budget 3"), (True, 3))
@@ -1237,6 +1259,28 @@ class FormControlInventoryTests(unittest.TestCase):
             ["username", "empty_value", "comment", "empty_text", "choice", "empty_choice"],
         )
         self.assertTrue(all(item["url"] is None for item in form_parameters))
+
+    def test_parameter_discovery_preserves_form_methods_and_html_default(self):
+        response = FakeResponse(
+            url="http://127.0.0.1/bWAPP/forms.php",
+            text=(
+                '<form method="get" action="/search.php"><input name="q"></form>'
+                '<form action="/default.php"><textarea name="term"></textarea></form>'
+                '<form method="post"><select name="csrf"></select></form>'
+            ),
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            parameters = self.namespace["discover_parameters"](response)
+
+        self.assertEqual(
+            [(item["method"], item["name"], item["url"]) for item in parameters],
+            [
+                ("GET", "q", "http://127.0.0.1/search.php"),
+                ("GET", "term", "http://127.0.0.1/default.php"),
+                ("POST", "csrf", None),
+            ],
+        )
 
     def test_form_like_text_in_comments_is_not_a_real_form(self):
         response = FakeResponse(

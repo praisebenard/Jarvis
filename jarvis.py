@@ -1004,11 +1004,25 @@ def discover_parameters(response):
         print("Form parameters:")
 
         for number, form in enumerate(forms, 1):
+            form_opening = re.search(r"<form\b([^>]*)>", form, re.I | re.S)
+            form_attributes = _html_attributes(form_opening.group(1)) if form_opening else {}
+            form_method = form_attributes.get("method", "GET").upper()
+            try:
+                form_url = urljoin(
+                    response.url,
+                    unescape(form_attributes.get("action", "")),
+                )
+            except (TypeError, ValueError, UnicodeError):
+                form_url = None
             for control in _form_control_inventory(form):
                 name = control["name"]
                 if not name or control["disabled"]:
                     continue
-                parameters.append({"method": "POST", "name": name, "url": None})
+                parameters.append({
+                    "method": form_method,
+                    "name": name,
+                    "url": form_url if form_method == "GET" else None,
+                })
                 print(f"  - Form {number}: {_safe_report_parameter_name(name)}")
     else:
         print("Form parameters: None")
