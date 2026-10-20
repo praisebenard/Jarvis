@@ -317,7 +317,8 @@ def _classify_reflection_context(response_text, marker):
         return None
 
     event_handler_attributes = {
-        "onabort", "onauxclick", "onbeforeinput", "onbeforetoggle", "onblur",
+        "onabort", "onauxclick", "onbeforeinput", "onbeforetoggle",
+        "onbeforeunload", "onblur",
         "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick",
         "onclose", "oncontextmenu", "oncopy", "oncuechange", "oncut",
         "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave",

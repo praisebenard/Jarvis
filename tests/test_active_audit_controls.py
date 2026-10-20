@@ -223,6 +223,7 @@ class ActiveAuditControlTests(unittest.TestCase):
             ("HTML text", "<p>private-response-secret JARVIS_TEST_12345</p>"),
             ("HTML attribute", '<div title="JARVIS_TEST_12345">item</div>'),
             ("event-handler attribute", '<button onclick="JARVIS_TEST_12345">item</button>'),
+            ("event-handler attribute", '<body onbeforeunload="JARVIS_TEST_12345">item</body>'),
             ("HTML attribute", '<div once="JARVIS_TEST_12345">item</div>'),
             ("script element", "<script>JARVIS_TEST_12345</script>"),
         )
@@ -250,6 +251,19 @@ class ActiveAuditControlTests(unittest.TestCase):
                 self.assertIn("Browser execution was not assessed", candidate[0][4])
                 self.assertNotIn("private-response-secret", candidate[0][4])
                 self.assertTrue(response.closed)
+
+    def test_reflection_marker_absent_does_not_create_a_candidate(self):
+        response = FakeResponse(text="<p>ordinary response</p>")
+        self.set_responses(response)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self.namespace["check_reflection"](
+                "https://authorized.example/item.php?q=old", "q", enabled=True
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(self.candidates, [])
+        self.assertTrue(response.closed)
 
     def test_reflection_context_parser_is_conservative_for_encoded_and_malformed_html(self):
         classify = self.namespace["_classify_reflection_context"]
