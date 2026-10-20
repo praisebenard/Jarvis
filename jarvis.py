@@ -1018,6 +1018,11 @@ def discover_parameters(response):
                 name = control["name"]
                 if not name or control["disabled"]:
                     continue
+                if form_method == "GET":
+                    key = (form_url, name)
+                    if key in seen_get_parameters:
+                        continue
+                    seen_get_parameters.add(key)
                 parameters.append({
                     "method": form_method,
                     "name": name,

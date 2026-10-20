@@ -788,6 +788,30 @@ class ActiveAuditControlTests(unittest.TestCase):
             for candidate in reflection_candidates
         ))
 
+    def test_get_form_parameter_matching_action_query_is_probed_once(self):
+        entry_url = "https://authorized.example/search.php?q=entry"
+        probe_url = "https://authorized.example/search.php?q=JARVIS_TEST_12345"
+        self.set_responses(
+            FakeResponse(
+                url=entry_url,
+                text=(
+                    '<form method="get" action="/search.php?q=entry">'
+                    '<input name="q"></form>'
+                ),
+            ),
+            FakeResponse(url=probe_url, text="JARVIS_TEST_12345 reflected"),
+        )
+
+        self.run_audit(entry_url, active_checks=True, request_budget=2)
+
+        self.assertEqual([call[0] for call in self.session.calls], [entry_url, probe_url])
+        reflection_candidates = [
+            candidate for candidate in self.candidates
+            if candidate[0][1] == "Reflected Input"
+        ]
+        self.assertEqual(len(reflection_candidates), 1)
+        self.assertEqual(len(self.saved_reports), 1)
+
     def test_active_reflection_keeps_post_fields_inventory_only(self):
         response = FakeResponse(
             url="https://authorized.example/login.php",
