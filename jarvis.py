@@ -1,5 +1,6 @@
 
 from html import unescape
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from urllib.parse import quote, quote_from_bytes, unquote, urljoin, urlparse, urlsplit, urlunsplit
 import hashlib
@@ -310,6 +311,101 @@ def get_url(target):
     return "https://" + target
 
 
+def _classify_reflection_context(response_text, marker):
+    """Return best-effort HTML contexts containing a marker, without snippets."""
+    if not isinstance(response_text, str):
+        return None
+
+    event_handler_attributes = {
+        "onabort", "onauxclick", "onbeforeinput", "onbeforetoggle", "onblur",
+        "oncancel", "oncanplay", "oncanplaythrough", "onchange", "onclick",
+        "onclose", "oncontextmenu", "oncopy", "oncuechange", "oncut",
+        "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave",
+        "ondragover", "ondragstart", "ondrop", "ondurationchange", "onemptied",
+        "onended", "onerror", "onfocus", "onformdata", "oninput", "oninvalid",
+        "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata",
+        "onloadedmetadata", "onloadstart", "onmessage", "onmousedown",
+        "onmouseenter", "onmouseleave", "onmousemove", "onmouseout", "onmouseover",
+        "onmouseup", "onpaste", "onpause", "onplay", "onplaying", "onprogress",
+        "onratechange", "onreset", "onresize", "onscroll", "onseeked", "onseeking",
+        "onselect", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle",
+        "onvolumechange", "onwaiting", "onwheel", "onpointercancel", "onpointerdown",
+        "onpointerenter", "onpointerleave", "onpointermove", "onpointerout",
+        "onpointerover", "onpointerup", "ontouchstart", "ontouchmove", "ontouchend",
+        "ontouchcancel", "onanimationcancel", "onanimationend", "onanimationiteration",
+        "onanimationstart", "ontransitioncancel", "ontransitionend", "ontransitionrun",
+        "ontransitionstart",
+    }
+
+    malformed_check_text = response_text if marker in response_text else unescape(response_text)
+    if re.search(
+        r"<[A-Za-z][^>]*" + re.escape(marker) + r"[^>]*$",
+        malformed_check_text,
+        re.S,
+    ):
+        return "HTML context ambiguous"
+
+    contexts = set()
+
+    class MarkerContextParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.raw_text_tag = None
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            for name, value in attrs:
+                if value is not None and marker in value:
+                    if name and name.lower() in event_handler_attributes:
+                        contexts.add("event-handler attribute")
+                    else:
+                        contexts.add("HTML attribute")
+            if tag in {"script", "style"}:
+                self.raw_text_tag = tag
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            if tag.lower() in {"script", "style"}:
+                self.raw_text_tag = None
+
+        def handle_endtag(self, tag):
+            if tag.lower() == self.raw_text_tag:
+                self.raw_text_tag = None
+
+        def handle_data(self, data):
+            if marker not in data:
+                return
+            if self.raw_text_tag == "script":
+                contexts.add("script element")
+            elif self.raw_text_tag == "style":
+                contexts.add("style element")
+            else:
+                contexts.add("HTML text")
+
+        def handle_comment(self, data):
+            if marker in data:
+                contexts.add("HTML comment")
+
+    parse_failed = False
+    try:
+        parser = MarkerContextParser()
+        parser.feed(response_text)
+        parser.close()
+    except Exception:
+        parse_failed = True
+
+    if not contexts and marker in response_text:
+        contexts.add("HTML context ambiguous" if parse_failed else "unclassified HTML")
+    if not contexts:
+        return None
+
+    if marker not in response_text:
+        contexts = {f"{context} (HTML character references decoded)" for context in contexts}
+    if parse_failed:
+        contexts.add("HTML context ambiguous")
+    return "; ".join(sorted(contexts))
+
+
 def check_reflection(url, parameter, enabled=False):
     if not enabled:
         print("  [SKIPPED] Active reflection checks require explicit opt-in.")
@@ -345,9 +441,13 @@ def check_reflection(url, parameter, enabled=False):
             headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"}
         )
         try:
-            if marker in response.text:
+            reflection_context = _classify_reflection_context(response.text, marker)
+            if reflection_context:
                 safe_parameter = _safe_report_parameter_name(parameter)
-                print(f"  [POTENTIAL] Parameter '{safe_parameter}' is reflected in the response.")
+                print(
+                    f"  [POTENTIAL] Parameter '{safe_parameter}' is reflected "
+                    f"in {reflection_context}."
+                )
 
                 record_candidate(
                     url,
@@ -356,11 +456,13 @@ def check_reflection(url, parameter, enabled=False):
                     f"Parameter '{parameter}' reflected the harmless JARVIS test marker.",
                     f"Marker: {marker}\nTest URL: {_render_report_endpoint(response.url)}\n"
                     f"HTTP status: {response.status_code}\n"
-                    f"Observation: marker appeared in response text; output context and browser execution were not assessed.",
+                    f"Reflection context: {reflection_context}\n"
+                    "Context classification is best-effort HTML parsing; malformed markup or browser parsing may differ. "
+                    "Browser execution was not assessed.",
                     observation_confidence="Confirmed observation: test marker appeared in response text",
                     testing_context=(
                         f"GET parameter: {parameter}; harmless marker only; "
-                        "no exploit payload sent."
+                        "no exploit payload sent; HTML context classification is evidence only."
                     ),
                 )
 

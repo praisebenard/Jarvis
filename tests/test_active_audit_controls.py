@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, quote_from_bytes, unquote, urljoin, urlparse, urlsplit, urlunsplit
@@ -48,7 +49,8 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.source_path = Path(__file__).resolve().parents[1] / "jarvis.py"
         tree = ast.parse(self.source_path.read_text())
         names = {
-            "scoped_get", "check_reflection", "_parse_audit_options",
+            "scoped_get", "check_reflection", "_classify_reflection_context",
+            "_parse_audit_options",
             "_escape_report_header_value",
             "_safe_report_parameter_name", "_render_report_endpoint",
             "_render_report_target", "_report_target_filename_component",
@@ -86,6 +88,7 @@ class ActiveAuditControlTests(unittest.TestCase):
             "urlparse": urlparse,
             "urlsplit": urlsplit,
             "urlunsplit": urlunsplit,
+            "HTMLParser": HTMLParser,
             "SimpleNamespace": SimpleNamespace,
             "DEFAULT_AUDIT_REQUEST_BUDGET": 25,
             "MAX_AUDIT_REQUEST_BUDGET": 100,
@@ -209,8 +212,85 @@ class ActiveAuditControlTests(unittest.TestCase):
             if candidate[0][1] == "Reflected Input"
         )
         evidence = reflection_candidate[0][4]
-        self.assertIn("output context and browser execution were not assessed", evidence)
+        self.assertIn("Reflection context: HTML text", evidence)
+        self.assertIn("best-effort HTML parsing", evidence)
+        self.assertIn("Browser execution was not assessed", evidence)
         self.assertIn("no exploit payload sent", reflection_candidate[1]["testing_context"])
+
+    def test_reflection_reports_html_text_attribute_and_script_contexts(self):
+        url = "http://127.0.0.1/bWAPP/xss_get.php?q=old"
+        cases = (
+            ("HTML text", "<p>private-response-secret JARVIS_TEST_12345</p>"),
+            ("HTML attribute", '<div title="JARVIS_TEST_12345">item</div>'),
+            ("event-handler attribute", '<button onclick="JARVIS_TEST_12345">item</button>'),
+            ("HTML attribute", '<div once="JARVIS_TEST_12345">item</div>'),
+            ("script element", "<script>JARVIS_TEST_12345</script>"),
+        )
+
+        for expected_context, body in cases:
+            with self.subTest(context=expected_context):
+                response = FakeResponse(
+                    url="http://127.0.0.1/bWAPP/xss_get.php?q=JARVIS_TEST_12345",
+                    text=body,
+                )
+                self.set_responses(response)
+                self.candidates.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = self.namespace["check_reflection"](
+                        url, "q", enabled=True
+                    )
+
+                self.assertTrue(result)
+                self.assertEqual(len(self.candidates), 1)
+                candidate = self.candidates[0]
+                self.assertEqual(candidate[0][2], "Potential")
+                self.assertIn(
+                    f"Reflection context: {expected_context}", candidate[0][4]
+                )
+                self.assertIn("Browser execution was not assessed", candidate[0][4])
+                self.assertNotIn("private-response-secret", candidate[0][4])
+                self.assertTrue(response.closed)
+
+    def test_reflection_context_parser_is_conservative_for_encoded_and_malformed_html(self):
+        classify = self.namespace["_classify_reflection_context"]
+        self.assertEqual(
+            classify("<p>JARVIS&#95;TEST_12345</p>", "JARVIS_TEST_12345"),
+            "HTML text (HTML character references decoded)",
+        )
+        encoded_response = FakeResponse(
+            url="https://authorized.example/?q=JARVIS_TEST_12345",
+            text="<p>JARVIS&#95;TEST_12345</p>",
+        )
+        self.set_responses(encoded_response)
+        self.candidates.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.namespace["check_reflection"](
+                "https://authorized.example/?q=old", "q", enabled=True
+            )
+        encoded_evidence = self.candidates[0][0][4]
+        self.assertIn("HTML character references decoded", encoded_evidence)
+        self.assertNotIn("&#95;", encoded_evidence)
+        self.assertIn("browser execution was not assessed", encoded_evidence.lower())
+
+        malformed_response = FakeResponse(
+            url="https://authorized.example/?q=JARVIS_TEST_12345",
+            text="<script>JARVIS_TEST_12345",
+        )
+        self.set_responses(malformed_response)
+        self.candidates.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.namespace["check_reflection"](
+                "https://authorized.example/?q=old", "q", enabled=True
+            )
+        malformed_evidence = self.candidates[0][0][4]
+        self.assertIn("Reflection context: unclassified HTML", malformed_evidence)
+        self.assertIn("malformed markup or browser parsing may differ", malformed_evidence)
+        self.assertEqual(self.candidates[0][0][2], "Potential")
+
+        unterminated_tag = classify(
+            '<div title="JARVIS_TEST_12345', "JARVIS_TEST_12345"
+        )
+        self.assertEqual(unterminated_tag, "HTML context ambiguous")
 
     def test_reflection_response_is_closed_after_normal_candidate_recording(self):
         url = "https://authorized.example/item.php?q=old"
@@ -784,7 +864,8 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertEqual(len(reflection_candidates), 4)
         self.assertTrue(all(candidate[0][2] == "Potential" for candidate in reflection_candidates))
         self.assertTrue(all(
-            "output context and browser execution were not assessed" in candidate[0][4]
+            "best-effort HTML parsing" in candidate[0][4]
+            and "Browser execution was not assessed" in candidate[0][4]
             for candidate in reflection_candidates
         ))
 

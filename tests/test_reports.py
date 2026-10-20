@@ -1636,7 +1636,8 @@ Evidence: recorded below; not independently verified
                 "Reflected Input",
                 "Potential",
                 "A harmless marker appeared in response text",
-                "Marker: TEST\nTest URL: http://lab.local/page",
+                "Marker: TEST\nTest URL: http://lab.local/page\n"
+                "Reflection context: script element; static context only",
                 observation_confidence="Confirmed observation: marker appeared in response text",
                 testing_context="Harmless marker only; no exploit payload sent",
             )
@@ -1649,6 +1650,7 @@ Evidence: recorded below; not independently verified
         )
         self.assertIn("Severity: Not assessed", report)
         self.assertIn("context-appropriate output encoding", report)
+        self.assertIn("Reflection context: script element; static context only", report)
 
     def test_overstated_user_metadata_is_never_presented_as_jarvis_conclusion(self):
         with contextlib.redirect_stdout(io.StringIO()):
