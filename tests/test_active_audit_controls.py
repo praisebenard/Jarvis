@@ -812,6 +812,65 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertEqual(len(reflection_candidates), 1)
         self.assertEqual(len(self.saved_reports), 1)
 
+    def test_get_form_actions_with_only_fragment_differences_share_one_probe(self):
+        entry_url = "http://127.0.0.1/bWAPP/index.php"
+        first_action = "http://127.0.0.1/bWAPP/search.php?q=old#first"
+        second_action = "http://127.0.0.1/bWAPP/search.php?q=old#second"
+        probe_url = "http://127.0.0.1/bWAPP/search.php?q=JARVIS_TEST_12345#first"
+        self.assertEqual(
+            requests.Request("GET", first_action).prepare().path_url,
+            requests.Request("GET", second_action).prepare().path_url,
+        )
+        self.set_responses(
+            FakeResponse(
+                url=entry_url,
+                text=(
+                    '<form method="get" action="search.php?q=old#first">'
+                    '<input name="q"></form>'
+                    '<form method="get" action="search.php?q=old#second">'
+                    '<input name="q"></form>'
+                ),
+            ),
+            FakeResponse(url=probe_url, text="JARVIS_TEST_12345 reflected"),
+        )
+
+        self.run_audit(entry_url, active_checks=True, request_budget=2)
+
+        self.assertEqual([call[0] for call in self.session.calls], [entry_url, probe_url])
+        reflection_candidates = [
+            candidate for candidate in self.candidates
+            if candidate[0][1] == "Reflected Input"
+        ]
+        self.assertEqual(len(reflection_candidates), 1)
+        self.assertEqual(len(self.saved_reports), 1)
+        self.assertTrue(any(
+            "search.php?q=%5BREDACTED%5D" in line
+            for line in self.saved_reports[0][1]
+        ))
+        self.assertIn("#first", reflection_candidates[0][0][0])
+
+    def test_get_form_parameter_keeps_distinct_query_variants(self):
+        response = FakeResponse(
+            url="http://127.0.0.1/bWAPP/index.php",
+            text=(
+                '<form method="get" action="search.php?q=one#first">'
+                '<input name="q"></form>'
+                '<form method="get" action="search.php?q=two#second">'
+                '<input name="q"></form>'
+            ),
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            parameters = self.namespace["discover_parameters"](response)
+
+        self.assertEqual(
+            [(item["name"], item["url"]) for item in parameters],
+            [
+                ("q", "http://127.0.0.1/bWAPP/search.php?q=one#first"),
+                ("q", "http://127.0.0.1/bWAPP/search.php?q=two#second"),
+            ],
+        )
+
     def test_fragment_variants_of_one_link_do_not_consume_duplicate_request_budget(self):
         entry_url = "http://127.0.0.1/bWAPP/index.php"
         first_page = "http://127.0.0.1/bWAPP/item.php?q=one#first"

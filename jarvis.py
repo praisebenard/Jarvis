@@ -700,9 +700,9 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
 
         parameters = discover_parameters(response)
         seen_get_parameters = {
-            (item["url"], item["name"])
+            (item["url"].split("#", 1)[0], item["name"])
             for item in parameters
-            if item["method"] == "GET"
+            if item["method"] == "GET" and item.get("url")
         }
         for page in local_pages:
             requested_page_url = page["requested_url"]
@@ -712,7 +712,7 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
             for item in discover_parameters(page_response):
                 if item["method"] != "GET":
                     continue
-                key = (item["url"], item["name"])
+                key = (item["url"].split("#", 1)[0], item["name"])
                 if key not in seen_get_parameters:
                     parameters.append(item)
                     seen_get_parameters.add(key)
@@ -957,7 +957,7 @@ def discover_parameters(response):
             name, separator, _value = item.partition("=")
             if not name:
                 continue
-            key = (url, name)
+            key = (url.split("#", 1)[0], name)
             if key not in seen_get_parameters:
                 parameters.append({"method": "GET", "name": name, "url": url})
                 seen_get_parameters.add(key)
@@ -981,7 +981,7 @@ def discover_parameters(response):
                 name, separator, _value = item.partition("=")
                 if not name:
                     continue
-                key = (full_url, name)
+                key = (full_url.split("#", 1)[0], name)
                 if key not in seen_get_parameters:
                     parameters.append({"method": "GET", "name": name, "url": full_url})
                     seen_get_parameters.add(key)
@@ -1012,7 +1012,10 @@ def discover_parameters(response):
                 if not name or control["disabled"]:
                     continue
                 if form_method == "GET":
-                    key = (form_url, name)
+                    key = (
+                        form_url.split("#", 1)[0] if form_url else form_url,
+                        name,
+                    )
                     if key in seen_get_parameters:
                         continue
                     seen_get_parameters.add(key)
