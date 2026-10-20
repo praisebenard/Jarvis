@@ -9,3 +9,7 @@ __pycache__/
 .agents/
 reports/
 scope.txt
+
+# Local backup files
+*.backup
+*.before_*
