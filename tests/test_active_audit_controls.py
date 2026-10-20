@@ -57,7 +57,7 @@ class ActiveAuditControlTests(unittest.TestCase):
             "check_security_headers", "get_page_title", "audit_target", "get_info",
             "discover_links", "discover_parameters",
             "_extract_html_forms", "discover_forms", "_summarize_form", "_html_attributes",
-            "_form_control_inventory",
+            "_form_method", "_form_control_inventory",
             "identify_review_areas", "identify_high_risk_parameters",
             "crawl_local_pages",
             "_get_audit_page_data",
@@ -1162,7 +1162,7 @@ class FormControlInventoryTests(unittest.TestCase):
         tree = ast.parse(source_path.read_text())
         wanted = {
             "_extract_html_forms", "discover_forms", "_extract_html_forms", "_summarize_form",
-            "_html_attributes", "_form_control_inventory",
+            "_html_attributes", "_form_method", "_form_control_inventory",
             "_safe_report_parameter_name",
             "inventory_local_forms", "discover_parameters",
         }
@@ -1305,6 +1305,54 @@ class FormControlInventoryTests(unittest.TestCase):
                 ("POST", "csrf", None),
             ],
         )
+
+    def test_form_method_inventory_ignores_data_method_attribute(self):
+        self.response = FakeResponse(
+            url="http://127.0.0.1/bWAPP/index.php",
+            text=(
+                '<form data-method="post" method="gEt" action="/search.php">'
+                '<input name="q"></form>'
+            ),
+        )
+        page = {
+            "requested_url": self.response.url,
+            "display_url": self.response.url,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            discovered = self.namespace["discover_parameters"](self.response)
+            inventoried = self.namespace["inventory_local_forms"]([page], {})
+
+        self.assertEqual(
+            [(item["method"], item["name"], item["url"]) for item in discovered],
+            [("GET", "q", "http://127.0.0.1/search.php")],
+        )
+        self.assertEqual(inventoried, [("GET", "q")])
+
+    def test_unsupported_form_method_uses_get_consistently(self):
+        self.response = FakeResponse(
+            url="http://127.0.0.1/bWAPP/index.php",
+            text=(
+                '<form method="PUT" action="/search.php">'
+                '<input name="q"></form>'
+            ),
+        )
+        page = {
+            "requested_url": self.response.url,
+            "display_url": self.response.url,
+        }
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            discovered = self.namespace["discover_parameters"](self.response)
+            inventoried = self.namespace["inventory_local_forms"]([page], {})
+
+        self.assertEqual(
+            [(item["method"], item["name"], item["url"]) for item in discovered],
+            [("GET", "q", "http://127.0.0.1/search.php")],
+        )
+        self.assertEqual(inventoried, [("GET", "q")])
+        self.assertIn("Form: method=GET", output.getvalue())
 
     def test_form_like_text_in_comments_is_not_a_real_form(self):
         response = FakeResponse(

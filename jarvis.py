@@ -557,19 +557,9 @@ def inventory_local_forms(pages, response_cache=None):
         print(f"  [PAGE] {_render_report_endpoint(display_url)}")
 
         for number, form in enumerate(forms, 1):
-            form_lower = form.lower()
-
-            method = "GET"
-            method_start = form_lower.find("method=")
-
-            if method_start != -1:
-                quote = form[method_start + 7]
-                if quote in ("'", '"'):
-                    value_start = method_start + 8
-                    value_end = form.find(quote, value_start)
-
-                    if value_end != -1:
-                        method = form[value_start:value_end].upper()
+            opening = re.search(r"<form\b([^>]*)>", form, re.I | re.S)
+            attributes = _html_attributes(opening.group(1)) if opening else {}
+            method = _form_method(attributes)
 
             print(f"    Form {number}: method={_safe_report_parameter_name(method)}")
 
@@ -1006,7 +996,7 @@ def discover_parameters(response):
         for number, form in enumerate(forms, 1):
             form_opening = re.search(r"<form\b([^>]*)>", form, re.I | re.S)
             form_attributes = _html_attributes(form_opening.group(1)) if form_opening else {}
-            form_method = form_attributes.get("method", "GET").upper()
+            form_method = _form_method(form_attributes)
             try:
                 form_url = urljoin(
                     response.url,
@@ -1093,6 +1083,14 @@ def _html_attributes(markup):
     return attributes
 
 
+def _form_method(attributes):
+    """Return the effective HTML form method, defaulting invalid values to GET."""
+    method = attributes.get("method", "").lower()
+    if method not in {"get", "post", "dialog"}:
+        method = "get"
+    return method.upper()
+
+
 def _form_control_inventory(form):
     """Extract control structure without retaining submitted values."""
     controls = []
@@ -1130,7 +1128,7 @@ def _summarize_form(form, base_url=None):
     """Describe form structure without serializing field values or raw markup."""
     opening = re.search(r"<form\b([^>]*)>", form, re.I | re.S)
     form_attributes = _html_attributes(opening.group(1)) if opening else {}
-    method = _safe_report_parameter_name(form_attributes.get("method", "GET").upper())
+    method = _safe_report_parameter_name(_form_method(form_attributes))
     action = unescape(form_attributes.get("action", ""))
     if action:
         try:
