@@ -1,0 +1,72 @@
+JARVIS NEXT TASKS
+
+1. RESOLVED — review-queue counts all saved reports, while
+   review-progress counts only outstanding reports.
+2. Keep Codex prompts focused on relevant functions and tests.
+3. Preserve existing reports and review notes.
+4. Run focused tests during development.
+5. Run py_compile and the full test suite after changes.
+6. Never treat an unconfirmed candidate as a verified vulnerability.
+7. Keep active testing restricted to the authorized local bWAPP lab.
+8. COMPLETED — review-queue and review-progress exclude all report symlinks;
+   full test suite passed 129 tests, 0 failed.
+9. COMPLETED — conditional-only PHP source-to-sink relationships use
+   `CONDITIONAL SOURCE PATTERNS; FLOW NOT ESTABLISHED`; unconditional
+   relationships retain `SOURCE PATTERNS DETECTED`. Vulnerability status
+   remains `UNCONFIRMED`; latest full test suite passed 129 tests, 0 failed.
+10. VERIFIED — `python3 -m py_compile jarvis.py` passed; `python3 -m unittest
+    discover -s tests -v` passed 130 tests, 0 failures. PHP flow relationship
+    reports include specific sink locations, and tracked-variable associations
+    do not claim a complete or proven data flow. Regression tests cover
+    distinct sink-variable associations, direct inline request references,
+    conditional relationships, and `UNCONFIRMED` status.
+11. VERIFIED — PHP flow source and sink locations use consistent paths relative
+    to the analyzed entry directory; paths outside it remain absolute.
+    `python3 -m py_compile jarvis.py` passed. `python3 -m unittest discover -s
+    tests -v` passed 130 tests, 0 failures. No target scans were run.
+12. VERIFIED — PHP include-edge source and target locations use `report_path`,
+    preserving directory identity for same-basename files. `python3 -m py_compile
+    jarvis.py` passed. `python3 -m unittest discover -s tests -v` passed 131
+    tests, 0 failures. No target scans were run.
+13. VERIFIED — the out-of-root PHP include regression test confirms the include
+    is unresolved and contributes no source or sink evidence; report status
+    remains `UNCONFIRMED`. `python3 -m py_compile jarvis.py` passed.
+    `python3 -m unittest discover -s tests -v` passed 132 tests, 0 failures.
+    No target scans were run.
+14. VERIFIED — unresolved dynamic, missing, and out-of-root PHP includes
+    qualify review status with `ANALYSIS INCOMPLETE —`, preserving the original
+    status label and each unresolved reason. Vulnerability status remains
+    `UNCONFIRMED`. `python3 -m py_compile jarvis.py` passed. `python3 -m
+    unittest discover -s tests -v` passed 135 tests, 0 failures. No target
+    scans were run.
+15. VERIFIED — the review queue preserves the full saved
+    `ANALYSIS INCOMPLETE — ...` status separately from
+    `Vulnerability status: UNCONFIRMED`; regression coverage checks that
+    unresolved-include evidence remains visible. The review-progress regression
+    confirms that only a valid review note counts as a reviewed report, while
+    priority and conclusion counts update accordingly. The latest full suite
+    passed 135 tests, 0 failures.
+16. VERIFIED — audit and web information reports preserve values for the four
+    checked HTTP security headers, retain `PRESENT`/`MISSING` labels, and use
+    `NOT RECORDED` when the response header mapping is unavailable. Header
+    values escape CR/LF, and legacy report summary behavior remains covered.
+    Regression tests cover CR/LF escaping through both `audit_target` and
+    `get_info`, legacy audit-report compatibility without captured header
+    values, and `NOT RECORDED` remaining distinct from `MISSING` and not serving
+    as confirmation evidence. Focused tests passed: 9 audit-control tests and
+    45 report tests. The full suite passed 157 tests, 0 failures;
+    `python3 -m py_compile jarvis.py` passed. No audits or network requests
+    were run.
+17. VERIFIED — `get_info` escapes CR/LF in `Server` and `Content-Type` values
+    before console output and report saving. Regression tests cover both fields
+    and verify ordinary values remain unchanged. Focused active-audit tests
+    passed 10 tests; the full suite passed 162 tests, 0 failures.
+    `python3 -m py_compile jarvis.py` passed.
+18. VERIFIED — `_parse_scope_url` performs bounded validation-only decoding
+    for nested path encodings, rejects non-stabilizing paths, and leaves the
+    once-decoded path unchanged for scope matching. Regression tests cover
+    scope rules, initial targets, redirects, and safe encoded-path matching.
+    The final two test-only regressions cover non-stabilization rejection and
+    original-URL preservation; both were reviewed read-only. Focused scope and
+    redirect tests passed 21 tests; the full suite passed 167 tests. No audits
+    or network requests were performed.
