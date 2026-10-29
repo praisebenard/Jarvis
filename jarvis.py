@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from urllib.parse import quote, quote_from_bytes, unquote, urljoin, urlparse, urlsplit, urlunsplit
 import hashlib
 import ipaddress
+import os
 import secrets
+import time
 import requests
 
 session = requests.Session()
@@ -15,15 +17,19 @@ session.headers.update({
 from pathlib import Path
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 
-SCOPE_FILE = Path("scope.txt")
+PROJECT_DIR = Path(__file__).resolve().parent
+SCOPE_FILE = PROJECT_DIR / "scope.txt"
 REPORTS_DIR = Path("reports")
 DEFAULT_AUDIT_REQUEST_BUDGET = 25
 MAX_AUDIT_REQUEST_BUDGET = 100
+DEFAULT_AUDIT_REQUEST_INTERVAL_SECONDS = 0.25
+MAX_REDIRECT_HOPS = 5
 _ACTIVE_AUDIT_REQUEST_BUDGET = None
 _REPORT_DISPLAY_ALIASES = {}
+_HTTP_SESSIONS = {}
 
 
 def load_scope():
@@ -191,15 +197,183 @@ def check_scope(target, announce=True):
     return False
 
 
+def _authorized_scope_context(url):
+    """Return normalized origin and the most-specific matching authorized path root."""
+    parsed_url = _parse_scope_url(url)
+    if parsed_url is None or not check_scope(url, announce=False):
+        raise requests.RequestException("Cannot select an authorized scope for this URL")
+
+    matching_allow_rules = [
+        rule for rule in load_scope()
+        if rule["effect"] == "ALLOW"
+        and rule["scheme"] == parsed_url["scheme"]
+        and rule["host"] == parsed_url["host"]
+        and rule["port"] == parsed_url["port"]
+        and _scope_path_matches(rule, parsed_url["path"])
+    ]
+    if not matching_allow_rules:
+        raise requests.RequestException("Cannot select an authorized scope for this URL")
+    target_rule = max(matching_allow_rules, key=lambda rule: len(rule["path"]))
+    return (
+        parsed_url["scheme"], parsed_url["host"], parsed_url["port"],
+        target_rule["path"], target_rule["prefix"],
+    )
+
+
+def _session_for_url(url):
+    """Return a session isolated by normalized origin and authorized path root."""
+    if not isinstance(session, requests.Session):
+        # Keep injected test/client sessions intact; production uses requests.Session.
+        return session
+
+    origin = _authorized_scope_context(url)
+    if origin in _HTTP_SESSIONS:
+        return _HTTP_SESSIONS[origin]
+
+    local_origin = ("http", "127.0.0.1", 80)
+    # The process-wide session carries the manually configured bWAPP cookie.
+    # Keep it bound to that path root; other loopback applications get their
+    # own cookie jars even though they share the same network origin.
+    if origin[:3] == local_origin and origin[3].rstrip("/") == "/bWAPP":
+        selected = session
+    else:
+        selected = requests.Session()
+        selected.headers.update({"User-Agent": "JARVIS-Lab-Assistant/1.0"})
+    _HTTP_SESSIONS[origin] = selected
+    return selected
+
+
+def _hackerone_handle_for_url(url):
+    """Return the optional program handle only for an explicitly configured scoped asset."""
+    handle = os.environ.get("JARVIS_HACKERONE_HANDLE", "").strip()
+    assets_text = os.environ.get("JARVIS_HACKERONE_ASSETS", "")
+    if (
+        not handle
+        or len(handle) > 128
+        or any(ord(char) < 33 or ord(char) > 126 for char in handle)
+        or not assets_text.strip()
+        or not check_scope(url, announce=False)
+    ):
+        return None
+
+    parsed_target = _parse_scope_url(url)
+    if parsed_target is None:
+        return None
+
+    asset_rules = []
+    for asset_text in assets_text.split(","):
+        asset_text = asset_text.strip()
+        if not asset_text:
+            continue
+        rule = _parse_scope_url(
+            asset_text,
+            require_explicit_port=True,
+            for_rule=True,
+        )
+        if rule is None:
+            # Ambiguous opt-in configuration must never cause header forwarding.
+            return None
+        asset_rules.append(rule)
+
+    if not asset_rules:
+        return None
+    if any(
+        rule["scheme"] == parsed_target["scheme"]
+        and rule["host"] == parsed_target["host"]
+        and rule["port"] == parsed_target["port"]
+        and _scope_path_matches(rule, parsed_target["path"])
+        for rule in asset_rules
+    ):
+        return handle
+    return None
+
+
+def _remove_hackerone_header(headers):
+    """Remove session-default copies so only scoped per-request policy adds it."""
+    if headers is None:
+        return
+    try:
+        names = list(headers.keys())
+        for name in names:
+            if isinstance(name, str) and name.casefold() == "x-hackerone-handle":
+                del headers[name]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise requests.RequestException(
+            "Cannot safely sanitize request session headers"
+        ) from exc
+
+
+def _keep_safe_redirect_headers(headers):
+    """Keep only explicitly safe caller headers across a scope boundary."""
+    if headers is None:
+        return
+    safe_names = {
+        "accept", "accept-encoding", "accept-language", "cache-control",
+        "if-match", "if-modified-since", "if-none-match",
+        "if-unmodified-since", "user-agent", "x-test-trace",
+    }
+    try:
+        names = list(headers.keys())
+        for name in names:
+            if not isinstance(name, str) or name.casefold() not in safe_names:
+                del headers[name]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise requests.RequestException(
+            "Cannot safely filter request headers at redirect boundary"
+        ) from exc
+
+
+def _snapshot_http_response_metadata(response):
+    """Copy only non-body response metadata needed for local diagnostics."""
+    headers = getattr(response, "headers", None)
+    header_get = getattr(headers, "get", None)
+    try:
+        content_type = header_get("Content-Type") if callable(header_get) else None
+        location = header_get("Location") if callable(header_get) else None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        content_type = None
+        location = None
+    return SimpleNamespace(
+        status_code=getattr(response, "status_code", None),
+        content_type=content_type,
+        location=location,
+    )
+
+
+def _attach_http_response_metadata(response, metadata):
+    """Attach detached scalar snapshots without retaining response bodies."""
+    response._jarvis_response_metadata = tuple(
+        SimpleNamespace(
+            status_code=item.status_code,
+            content_type=item.content_type,
+            location=item.location,
+        )
+        for item in metadata
+    )
+    return response
+
+
 def scoped_get(url, **kwargs):
     if not check_scope(url, announce=False):
         raise requests.RequestException(
-            f"Request blocked outside authorized scope: {url}"
+            "Request blocked outside authorized scope: "
+            f"{_render_report_endpoint(url)}"
         )
 
     kwargs["allow_redirects"] = False
+    caller_headers = dict(kwargs.get("headers") or {})
+    caller_headers = {
+        name: value for name, value in caller_headers.items()
+        if not isinstance(name, str) or name.casefold() != "x-hackerone-handle"
+    }
     redirects = 0
-    max_redirects = getattr(session, "max_redirects", 30)
+    scope_context = _authorized_scope_context(url)
+    request_session = _session_for_url(url)
+    max_redirects = min(
+        getattr(request_session, "max_redirects", MAX_REDIRECT_HOPS),
+        MAX_REDIRECT_HOPS,
+    )
+    response_metadata = []
 
     while True:
         budget = _ACTIVE_AUDIT_REQUEST_BUDGET
@@ -207,13 +381,36 @@ def scoped_get(url, **kwargs):
             if budget["used"] >= budget["limit"]:
                 budget["exhausted"] = True
                 raise requests.RequestException("Audit request budget exhausted")
+            minimum_interval = budget.get("minimum_interval", 0)
+            previous_request_at = budget.get("last_request_at")
+            if minimum_interval > 0 and previous_request_at is not None:
+                delay = minimum_interval - (time.monotonic() - previous_request_at)
+                if delay > 0:
+                    time.sleep(delay)
             budget["used"] += 1
-        response = session.get(url, **kwargs)
+            if minimum_interval > 0:
+                budget["last_request_at"] = time.monotonic()
+        request_kwargs = dict(kwargs)
+        request_headers = dict(caller_headers)
+        # Requests merges Session.headers into each PreparedRequest. Suppress
+        # any caller-installed default before adding an authorized per-request
+        # value, and repeat this after every redirect/session selection.
+        _remove_hackerone_header(getattr(request_session, "headers", None))
+        hackerone_handle = _hackerone_handle_for_url(url)
+        if hackerone_handle:
+            request_headers["X-HackerOne-Handle"] = hackerone_handle
+        if request_headers or "headers" in kwargs:
+            request_kwargs["headers"] = request_headers
+        response = request_session.get(url, **request_kwargs)
+        response_metadata.append(_snapshot_http_response_metadata(response))
+        # Keep the current hop's detached snapshot even if policy later blocks
+        # this redirect and closes the live response.
+        _attach_http_response_metadata(response, response_metadata)
 
         if not response.is_redirect:
             return response
 
-        location = response.headers.get("Location")
+        location = response_metadata[-1].location
         if not location:
             return response
 
@@ -225,8 +422,27 @@ def scoped_get(url, **kwargs):
         if not check_scope(redirect_url, announce=False):
             response.close()
             raise requests.RequestException(
-                f"Redirect blocked outside authorized scope: {redirect_url}"
+                "Redirect blocked outside authorized scope: "
+                f"{_render_report_endpoint(redirect_url)}"
             )
+
+        try:
+            redirect_scope_context = _authorized_scope_context(redirect_url)
+        except requests.RequestException:
+            response.close()
+            raise
+
+        if redirect_scope_context != scope_context:
+            # Active scope does not mean arbitrary caller headers are safe to
+            # reuse at a different origin or independently authorized path root.
+            try:
+                _keep_safe_redirect_headers(caller_headers)
+                _keep_safe_redirect_headers(getattr(request_session, "headers", None))
+            except requests.RequestException:
+                response.close()
+                raise
+            kwargs.pop("cookies", None)
+            kwargs.pop("auth", None)
 
         if redirects >= max_redirects:
             response.close()
@@ -236,6 +452,8 @@ def scoped_get(url, **kwargs):
 
         response.close()
         url = redirect_url
+        scope_context = redirect_scope_context
+        request_session = _session_for_url(url)
         redirects += 1
 
 
@@ -243,7 +461,8 @@ def _get_audit_page_data(url, response_cache):
     """Return a per-audit response snapshot keyed by the exact requested URL."""
     if not check_scope(url, announce=False):
         raise requests.RequestException(
-            f"Request blocked outside authorized scope: {url}"
+            "Request blocked outside authorized scope: "
+            f"{_render_report_endpoint(url)}"
         )
 
     if url in response_cache:
@@ -268,11 +487,23 @@ def _get_audit_page_data(url, response_cache):
             )
         except (AttributeError, TypeError, ValueError):
             copied_headers = None
+        response_metadata = getattr(response, "_jarvis_response_metadata", None)
+        if response_metadata is None:
+            response_metadata = (_snapshot_http_response_metadata(response),)
+        response_metadata = tuple(
+            SimpleNamespace(
+                status_code=item.status_code,
+                content_type=item.content_type,
+                location=item.location,
+            )
+            for item in response_metadata
+        )
         page_data = SimpleNamespace(
             requested_url=url,
             final_url=response.url,
             url=response.url,
             status_code=response.status_code,
+            response_metadata=response_metadata,
             headers=copied_headers,
             text=response.text,
         )
@@ -288,7 +519,7 @@ def show_scope():
 
     print("JARVIS: Authorized targets:")
 
-    if not targets:
+    if not rules:
         print("  (none)")
         return
 
@@ -465,6 +696,31 @@ def check_reflection(url, parameter, enabled=False):
                         f"GET parameter: {parameter}; harmless marker only; "
                         "no exploit payload sent; HTML context classification is evidence only."
                     ),
+                    observed_evidence=(
+                        "The harmless JARVIS marker appeared in the HTTP response text.\n"
+                        f"HTTP status: {response.status_code}\n"
+                        f"Best-effort HTML context: {reflection_context}"
+                    ),
+                    evidence_source="JARVIS active GET reflection check",
+                    evidence_endpoint=response.url,
+                    scanner_interpretation=(
+                        f"Reflection in {reflection_context} is a potential output-handling review signal; "
+                        "it does not establish script execution or a vulnerability."
+                    ),
+                    validation_limitations=(
+                        "The response body was not saved. Browser execution, exploitability, and impact were not tested."
+                    ),
+                    structured_test_result={
+                        "schema_version": 1,
+                        "method": "scoped_get",
+                        "test_type": "harmless_reflection_marker",
+                        "observation": "marker_reflected",
+                        "requested_endpoint": request_url,
+                        "final_response_endpoint": response.url,
+                        "response_origin": "fresh",
+                        "evidence_completeness": "complete",
+                        "not_established": ["browser_execution", "exploitability", "impact"],
+                    },
                 )
 
                 return True
@@ -612,6 +868,7 @@ def audit_local_pages(pages, response_cache=None):
             response = _get_audit_page_data(requested_url, response_cache)
 
             print(f"  [PAGE] {_render_report_endpoint(display_url)}")
+            print(f"    Requested URL: {_render_report_endpoint(requested_url)}")
             print(f"    Status: {response.status_code}")
             print(f"    Final URL: {_render_report_endpoint(response.url)}")
             print(f"    Title: {_escape_report_user_field(get_page_title(response))}")
@@ -736,6 +993,8 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
         "limit": request_budget,
         "used": 0,
         "exhausted": False,
+        "minimum_interval": DEFAULT_AUDIT_REQUEST_INTERVAL_SECONDS,
+        "last_request_at": None,
     }
     _ACTIVE_AUDIT_REQUEST_BUDGET = budget_state
     try:
@@ -848,12 +1107,22 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
                 record_candidate(
                     url,
                     "High-Risk Input",
-                    "Potential Critical",
+                    "",
                     f"JARVIS identified an input that may require deeper security review: {item}",
                     f"Target URL: {url}\nParameter: {item}\n"
                     "Evidence basis: parameter name classification only.",
                     observation_confidence="Heuristic candidate: parameter-name match",
                     testing_context="Observed during authorized-scope page/form inventory; no exploit payload sent.",
+                    observed_evidence=(
+                        f"The parameter name was present in JARVIS's authorized-scope input inventory: {item}."
+                    ),
+                    evidence_source="JARVIS page and form inventory",
+                    scanner_interpretation=(
+                        "A name-based heuristic selected this input for manual review; its behavior was not tested."
+                    ),
+                    validation_limitations=(
+                        "No payload was sent, and no vulnerable behavior or impact was demonstrated."
+                    ),
                 )
         else:
             print("  None")
@@ -881,12 +1150,13 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
 
         print("SQL Injection Review:")
 
+        report.append("SQL Injection Heuristic Signals:")
         if sql_review_parameters:
             for method, name, endpoint_url in sql_review_parameters:
                 print(
-                    f"  [POTENTIAL] {_safe_report_parameter_name(method)} parameter "
+                    f"  [HEURISTIC REVIEW] {_safe_report_parameter_name(method)} parameter "
                     f"'{_safe_report_parameter_name(name)}' "
-                    "may reach database query logic."
+                    "matched a name-based review signal; query handling was not observed."
                 )
 
                 endpoint_evidence = (
@@ -895,21 +1165,16 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
                     if method == "GET" and endpoint_url
                     else "Source: local form inventory; endpoint provenance was not retained.\n"
                 )
-
-                record_candidate(
-                    url,
-                    "SQL Injection",
-                    "Potential High",
-                    f"Parameter '{name}' is a plausible database-query input.",
-                    f"Method: {method}\nParameter: {name}\n"
-                    + endpoint_evidence
-                    + "Evidence basis: parameter-name match only; query handling was not observed.\n"
-                    + "No exploit payload was sent; manual verification required.",
-                    observation_confidence="Heuristic candidate: parameter-name match",
-                    testing_context=f"{method} parameter found in authorized-scope page/form inventory; no exploit payload sent.",
+                report.append(
+                    f"  Detected review signal: {_safe_report_parameter_name(method)} parameter "
+                    f"'{_safe_report_parameter_name(name)}'\n"
+                    f"{endpoint_evidence.rstrip()}\n"
+                    "  Basis: parameter-name heuristic only; query handling and source-to-query flow were not observed.\n"
+                    "  State: detected for review only; no SQL injection candidate or vulnerability was established."
                 )
         else:
             print("  None")
+            report.append("  None")
         if active_checks:
             print(f"Active Reflection Checks (request budget: {request_budget}):")
             report.append(
@@ -933,20 +1198,12 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
             for area in review_areas:
                 safe_area = _escape_report_user_field(area)
                 print(f"  - {safe_area}")
-
-                record_finding(
-                    url,
-                    f"Input Review Area - {safe_area}",
-                    f"JARVIS identified an input requiring manual review: {safe_area}",
-                    f"Target URL: {_render_report_endpoint(url)}\nReview area: {safe_area}",
-                    observation_confidence="Heuristic review area based on discovered parameter metadata",
-                    testing_context=f"Authorized-scope audit of {url}; input discovery only, no exploit payload sent.",
-                )
         else:
             print("  None")
 
         report.append("Review Areas:")
         if review_areas:
+            report.append("  Inventory-based review prompts only; these are not vulnerability findings.")
             for area in review_areas:
                 report.append(f"  - {_escape_report_user_field(area)}")
         else:
@@ -1126,6 +1383,7 @@ def discover_parameters(response):
                     "method": form_method,
                     "name": name,
                     "url": form_url if form_method == "GET" else None,
+                    "form_action": form_url,
                 })
                 print(f"  - Form {number}: {_safe_report_parameter_name(name)}")
     else:
@@ -1220,6 +1478,24 @@ def _form_control_inventory(form):
         disabled = bool(
             re.search(r"(?:^|\s)disabled(?:\s|=|/|$)", attribute_text, re.I)
         )
+        control_type = attributes.get("type", "text").strip().lower()
+        control_name = attributes.get("name", "").strip()
+        sensitive_name = bool(re.search(
+            r"(?:pass(?:word|wd)?|csrf|xsrf|token|session|auth|secret|"
+            r"credential|api[_-]?key)",
+            control_name,
+            re.I,
+        ))
+        action_type = control_type in {
+            "hidden", "submit", "button", "reset", "image"
+        }
+        if control_type == "password" or sensitive_name:
+            risk = "sensitive"
+        elif action_type:
+            risk = "action-related"
+        else:
+            risk = "review-only"
+
         controls.append({
             "kind": kind,
             "type": attributes.get("type", "text"),
@@ -1229,6 +1505,7 @@ def _form_control_inventory(form):
             "multiple": kind == "Select" and bool(
                 re.search(r"(?:^|\s)multiple(?:\s|=|/|$)", attribute_text, re.I)
             ),
+            "risk": risk,
         })
     return controls
 
@@ -1267,6 +1544,7 @@ def _summarize_form(form, base_url=None):
             description += " | value omitted"
         if control["disabled"]:
             description += " | disabled"
+        description += f" | risk={control.get('risk', 'review-only')}"
         lines.append(description)
     return lines
 
@@ -1435,6 +1713,49 @@ def _escape_report_user_field(value):
     return url_pattern.sub(redact, escaped)
 
 
+def _redact_potential_secrets(value):
+    """Redact recognizable credential values before report output or logging."""
+    text = str(value)
+    assignment = re.compile(
+        r"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*?)?"
+        r"(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
+        r"auth[_-]?token|private[_-]?key|password|passwd|secret|token|credential)"
+        r"\b\s*[:=]\s*)"
+        r"(?!(?:%5BREDACTED%5D|\[REDACTED(?:_[A-Z]+)?\]))"
+        r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;)}]+)"
+    )
+    header_credential = re.compile(
+        r"(?i)(\b(?:authorization|proxy-authorization|cookie|set-cookie)\b\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|(?:bearer|basic)\s+[^\s,;)}]+|[^\s,;)}]+)"
+    )
+    text = assignment.sub(r"\1[REDACTED]", text)
+    text = header_credential.sub(r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+        r"xox[baprs]-[A-Za-z0-9-]{10,}|sk_(?:live|test)_[A-Za-z0-9]{12,})\b",
+        "[REDACTED_TOKEN]",
+        text,
+    )
+    text = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b",
+        "[REDACTED_TOKEN]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(https?://)[^/\s:@]+:[^/@\s]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    text = re.sub(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        "[REDACTED_PRIVATE_KEY]",
+        text,
+        flags=re.S,
+    )
+    return text
+
+
 def check_security_headers(response):
     headers_to_check = {
         "Content-Security-Policy": "Helps reduce content-injection risks.",
@@ -1517,6 +1838,8 @@ def save_report(target, report):
 
     if isinstance(report, list):
         report = "\n".join(report)
+
+    report = _redact_potential_secrets(report)
 
     report_file.write_text(report)
 
@@ -1638,11 +1961,217 @@ def scan_php_inputs(directory):
     print(f"JARVIS: Unique input references: {total_inputs}")
 
 
-def _trace_php_flow(path, source, reports_dir):
+def _begin_source_analysis_provenance():
+    analyzer_path = Path(__file__).resolve()
+    try:
+        analyzer_hash = hashlib.sha256(analyzer_path.read_bytes()).hexdigest()
+    except OSError:
+        analyzer_hash = None
+    return {
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "analyzer_path": analyzer_path,
+        "analyzer_sha256": analyzer_hash,
+    }
+
+
+def _format_source_analysis_provenance(
+    provenance, source_snapshots, source_read_errors="ignore"
+):
+    lines = [
+        "Report provenance:",
+        f"  Analysis started (UTC): {provenance['started_utc']}",
+        f"  Report prepared (UTC): {datetime.now(timezone.utc).isoformat()}",
+        f"  Analyzer source: {provenance['analyzer_path']}",
+        f"  Analyzer source SHA-256: {provenance['analyzer_sha256'] or 'unavailable'}",
+    ]
+    try:
+        current_analyzer_hash = hashlib.sha256(
+            Path(provenance["analyzer_path"]).read_bytes()
+        ).hexdigest()
+        analyzer_current = current_analyzer_hash == provenance["analyzer_sha256"]
+        lines.append(
+            "  Analyzer source unchanged when report was prepared: "
+            + ("YES" if analyzer_current else "NO")
+        )
+    except OSError:
+        lines.append("  Analyzer source unchanged when report was prepared: UNKNOWN")
+
+    source_checks = []
+    lines.append("  Analyzed source snapshots:")
+    for source_path, source_text in sorted(
+        source_snapshots.items(), key=lambda item: str(item[0])
+    ):
+        source_path = Path(source_path).resolve()
+        source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        try:
+            current_text = source_path.read_text(errors=source_read_errors)
+            current = "YES" if current_text == source_text else "NO"
+        except OSError:
+            current = "UNKNOWN"
+        source_checks.append(current)
+        lines.extend([
+            f"    Source file: {source_path}",
+            f"    Source SHA-256: {source_hash}",
+            f"    Matches current file when report was prepared: {current}",
+        ])
+    if source_checks and all(check == "YES" for check in source_checks):
+        freshness = "YES (all analyzed source files matched their snapshots)"
+    elif any(check == "NO" for check in source_checks):
+        freshness = "NO (one or more analyzed source files changed during analysis)"
+    else:
+        freshness = "UNKNOWN (one or more analyzed source files could not be checked)"
+    lines.append(f"  Source matched analyzed snapshot when report was prepared: {freshness}")
+    return lines
+
+
+def _triage_static_severity(evidence):
+    """Apply a conservative severity rubric to explicit, structured evidence.
+
+    Static source-to-sink observations alone are deliberately insufficient to
+    assign a tier. This helper does not validate a finding or change its status.
+    """
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    allowed = {
+        "impact": {"low", "moderate", "serious", "severe"},
+        "exploitability": {"demonstrated", "strong_static", "pattern_only"},
+        "authentication": {"none", "low", "standard", "privileged"},
+    }
+    required = (
+        "vulnerability_class", "source_locations", "sink_locations", "impact",
+        "exploitability", "trust_boundary", "authentication", "in_scope",
+        "controls_reviewed", "controls_effective",
+    )
+    missing = [key for key in required if key not in evidence or evidence[key] is None]
+    for key in ("source_locations", "sink_locations"):
+        locations = evidence.get(key)
+        if (
+            not isinstance(locations, (list, tuple))
+            or not locations
+            or any(not isinstance(item, str) or not item.strip() for item in locations)
+        ) and key not in missing:
+            missing.append(key)
+    if (
+        not isinstance(evidence.get("vulnerability_class"), str)
+        or not evidence.get("vulnerability_class", "").strip()
+    ) and "vulnerability_class" not in missing:
+        missing.append("vulnerability_class")
+    for key, choices in allowed.items():
+        if evidence.get(key) not in choices and key not in missing:
+            missing.append(key)
+    if not isinstance(evidence.get("trust_boundary"), str) or not evidence.get("trust_boundary", "").strip():
+        if "trust_boundary" not in missing:
+            missing.append("trust_boundary")
+    if not isinstance(evidence.get("in_scope"), bool) and "in_scope" not in missing:
+        missing.append("in_scope")
+    if evidence.get("controls_reviewed") is not True and "controls_reviewed" not in missing:
+        missing.append("controls_reviewed")
+    if not isinstance(evidence.get("controls_effective"), bool) and "controls_effective" not in missing:
+        missing.append("controls_effective")
+
+    if missing or evidence.get("exploitability") != "demonstrated" or evidence.get("in_scope") is not True:
+        reasons = []
+        if missing:
+            reasons.append("missing or invalid evidence: " + ", ".join(sorted(set(missing))))
+        if evidence.get("exploitability") != "demonstrated":
+            reasons.append("static patterns or traces do not demonstrate exploitability")
+        if evidence.get("in_scope") is not True:
+            reasons.append("in-scope status is not established")
+        return {
+            "severity": "NEEDS_REVIEW",
+            "confidence": "Low",
+            "rationale": "; ".join(reasons) or "Evidence is insufficient for severity triage.",
+        }
+
+    impact = evidence["impact"]
+    boundary = evidence["trust_boundary"].casefold()
+    authentication = evidence["authentication"]
+    controls_effective = evidence["controls_effective"]
+    if (impact == "severe" and "cross-tenant" in boundary
+            and authentication == "none" and controls_effective is False):
+        severity = "Critical"
+    elif impact in {"serious", "severe"} and controls_effective is False:
+        severity = "High"
+    elif impact == "moderate" and controls_effective is False:
+        severity = "Medium"
+    elif impact == "low" and controls_effective is False:
+        severity = "Low"
+    elif impact == "low" and controls_effective is True:
+        severity = "Informational"
+    else:
+        return {
+            "severity": "NEEDS_REVIEW",
+            "confidence": "Medium",
+            "rationale": "Evidence is recorded, but impact and control effectiveness do not match a supported tier rule.",
+        }
+    return {
+        "severity": severity,
+        "confidence": "High" if severity in {"Critical", "High"} else "Medium",
+        "rationale": (
+            f"Recorded impact is {impact}; exploitability is marked demonstrated; "
+            f"trust boundary is {evidence['trust_boundary']}; authentication is "
+            f"{authentication}; controls were reviewed and recorded as "
+            f"{'effective' if controls_effective else 'ineffective'}; scope is established."
+        ),
+    }
+
+
+def _source_flow_severity_lines(vulnerability_class, source_locations, sink_locations):
+    """Format a severity assessment for static-only source-flow evidence."""
+    assessment = _triage_static_severity({
+        "vulnerability_class": vulnerability_class,
+        "source_locations": source_locations,
+        "sink_locations": sink_locations,
+        "impact": None,
+        "exploitability": "pattern_only",
+        "trust_boundary": None,
+        "authentication": None,
+        "in_scope": None,
+        "controls_reviewed": False,
+        "controls_effective": None,
+    })
+    return [
+        "Severity triage:",
+        f"  Severity: {assessment['severity']}",
+        f"  Severity confidence: {assessment['confidence']}",
+        f"  Rationale: {assessment['rationale']}.",
+        "  Evidence basis: source and sink observations are static code facts only; impact, runtime exploitability, trust-boundary crossing, authentication, scope, and effective protections are not established.",
+        "  Coverage limitation: this triage uses narrow source-flow observations for SQL/query, HTML output, selected URL-fetch and file-read calls, direct PHP dangerous operations, and limited PHP upload review; authorization, IDOR, and general SSRF/path traversal are not generally analyzed here; cryptography and security configuration are also outside comprehensive coverage.",
+        "  Vulnerability status remains UNCONFIRMED.",
+    ]
+
+
+def _write_php_flow_report(path, report, reports_dir):
+    report = _redact_potential_secrets(report)
+    reports_dir = Path(reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", path.stem).strip("_").lower()
+    base = f"{safe_name}_php_flow"
+    for index in range(1000):
+        suffix = "" if index == 0 else f"_{index}"
+        report_file = reports_dir / f"{base}{suffix}.txt"
+        try:
+            with report_file.open("x", encoding="utf-8") as handle:
+                handle.write(report)
+            return report_file
+        except FileExistsError:
+            continue
+    raise OSError("Could not allocate a unique PHP-flow report filename")
+
+
+def _trace_php_flow(path, source, reports_dir, provenance=None):
     """Trace only explicit request references and supported local assignments."""
     root = path.resolve().parent
     root_file = path.resolve()
     input_pattern = re.compile(r"\$_(GET|POST|REQUEST)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]")
+    form_control_pattern = re.compile(r"<\s*(input|textarea|select|button)\b([^>]*)>", re.I | re.S)
+    form_name_pattern = re.compile(r"(?:^|\s)name\s*=\s*(?:['\"]([^'\"]*)['\"]|([^\s>]+))", re.I)
+    php_region_pattern = re.compile(r"<\?(?:php\b|=).*?\?>", re.I | re.S)
+    html_comment_pattern = re.compile(r"<!--.*?-->", re.S)
+    sql_statement_pattern = re.compile(
+        r"^\s*\$(\w+)\s*=\s*(['\"])\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.I
+    )
     presence_ternary_pattern = re.compile(
         r"^isset\s*\(\s*\$_(GET|POST|REQUEST)\s*\[\s*(['\"])([^'\"]+)\2\s*\]\s*\)\s*\?\s*1\s*:\s*0$",
         re.I,
@@ -1650,13 +2179,29 @@ def _trace_php_flow(path, source, reports_dir):
     assignment_pattern = re.compile(r"^\s*\$(\w+)\s*(=|\.=)\s*(.*?)\s*;\s*$")
     variable_pattern = re.compile(r"\$(\w+)")
     include_pattern = re.compile(r"^\s*(include_once|include|require_once|require)\s*(?:\(\s*)?(.+?)\s*\)?\s*;\s*$")
+    dangerous_operation_names = (
+        "exec", "system", "shell_exec", "passthru", "popen", "proc_open",
+        "eval", "unserialize", "file_get_contents", "file_put_contents",
+        "fopen", "readfile", "unlink", "move_uploaded_file",
+    )
+    command_execution_names = {
+        "exec", "system", "shell_exec", "passthru", "popen", "proc_open",
+    }
+    file_read_operation_names = {"file_get_contents", "readfile"}
     origins, edges, inputs, conditional_inputs, presence_inputs = {}, {}, [], [], []
     unresolved_request_inputs, includes, sinks, sink_observations, unresolved = [], [], [], [], []
+    form_controls, database_observations = [], []
+    stored_data_observations, stored_data_flows, unresolved_stored_data = [], [], []
+    select_output_flows = []
+    guards_by_source_line = {}
+    unsupported_source_lines = set()
+    prepared_statement_observations, prepared_statement_flows = [], []
     invalidated = {}
     function_definition_diagnostics_seen = set()
     function_call_diagnostics_seen = set()
     function_expression_diagnostics_seen = set()
     source_lines_by_file = {}
+    source_text_by_file = {}
     visited, active = set(), []
 
     def mask_php_sink_code(line, state):
@@ -1724,6 +2269,20 @@ def _trace_php_flow(path, source, reports_dir):
             if code_line[match.start():match.start() + 2] == "$_":
                 references.append((match.group(1), match.group(2)))
         return references
+
+    def static_form_controls(file, source_text):
+        """Inventory literal HTML controls separately from PHP request sources."""
+        def blank_markup(match):
+            return "".join("\n" if char == "\n" else " " for char in match.group())
+
+        html_text = php_region_pattern.sub(blank_markup, source_text)
+        html_text = html_comment_pattern.sub(blank_markup, html_text)
+        records = []
+        for match in form_control_pattern.finditer(html_text):
+            name_match = form_name_pattern.search(match.group(2))
+            name = (name_match.group(1) if name_match.group(1) is not None else name_match.group(2)) if name_match else None
+            records.append((match.group(1).lower(), name or "(unnamed)", file, html_text.count("\n", 0, match.start()) + 1))
+        return records
 
     def classify_request_expression(expression):
         """Separate supported values, known presence flags, and uncertain references."""
@@ -1797,6 +2356,45 @@ def _trace_php_flow(path, source, reports_dir):
             return target
         return None
 
+    def transformation_category(name):
+        transform_name = name.lower()
+        if transform_name in {
+            "htmlentities", "htmlspecialchars",
+        }:
+            return "html-output-encoding"
+        if transform_name == "addslashes":
+            return "quote-escaping"
+        if transform_name in {
+            "mysql_real_escape_string", "mysqli_real_escape_string",
+        }:
+            return "sql-escaping"
+        if transform_name == "escapeshellarg":
+            return "shell-argument-escaping"
+        if transform_name == "escapeshellcmd":
+            return "shell-command-escaping"
+        if transform_name == "basename":
+            return "path-component-reduction"
+        if transform_name == "realpath":
+            return "path-canonicalization"
+        return "other-transformation"
+
+    def transformation_context_note(category, sink_type):
+        if category == "quote-escaping":
+            if sink_type == "output":
+                return "addslashes quote escaping observed; it is not HTML output encoding, and HTML-context protection is not inferred. Transformation effectiveness is not inferred."
+            if sink_type == "SQL/query":
+                return "addslashes quote escaping observed; SQL-context effectiveness is not inferred. Transformation effectiveness is not inferred."
+            return "addslashes quote escaping observed, but the sink context is ambiguous; no protection is inferred."
+        if category == "shell-argument-escaping":
+            return "escapeshellarg argument transformation observed; safe argument boundaries, option handling, command composition, and runtime behavior are not established."
+        if category == "shell-command-escaping":
+            return "escapeshellcmd command-string transformation observed; this is not equivalent to safely separating arguments, and command safety is not established."
+        if category == "path-component-reduction":
+            return "basename path-component reduction observed; this does not establish base-directory containment, symlink safety, or that the transformation is used on every path."
+        if category == "path-canonicalization":
+            return "realpath canonicalization observed; containment against an intended base, failure handling, symlink policy, and use of the canonical result are not established."
+        return None
+
     def summarize_function(file, start_line, params_text, body_lines):
         raw_params = split_top_level_list(params_text) if params_text.strip() else []
         params = []
@@ -1825,6 +2423,252 @@ def _trace_php_flow(path, source, reports_dir):
         def reject(reason, line_number, excerpt):
             return None, reason, (file, line_number, excerpt.strip()[:180])
 
+        def summarize_return_expression(expression, allow_helper_call=False):
+            expression = expression.strip()
+            variable = re.fullmatch(r"\$(\w+)", expression)
+            if variable and variable.group(1) in params:
+                return {
+                    "parameter": variable.group(1),
+                    "kind": "identity",
+                    "expression": expression,
+                }
+            call = re.fullmatch(r"([A-Za-z_]\w*)\s*\((.*)\)", expression)
+            recognized_transforms = {
+                "addslashes": 0,
+                "htmlentities": 0,
+                "htmlspecialchars": 0,
+                "mysql_real_escape_string": 0,
+                "mysqli_real_escape_string": 1,
+                "escapeshellarg": 0,
+                "escapeshellcmd": 0,
+                "basename": 0,
+                "realpath": 0,
+            }
+            if not call:
+                return None
+            arguments = split_top_level_list(call.group(2))
+            transform_name = call.group(1).lower()
+            parameter_index = recognized_transforms.get(transform_name)
+            if parameter_index is not None:
+                if parameter_index >= len(arguments):
+                    return None
+                parameter_match = re.fullmatch(r"\$(\w+)", arguments[parameter_index])
+                if not parameter_match or parameter_match.group(1) not in params:
+                    return None
+                if not all(
+                    index == parameter_index or re.fullmatch(
+                        r"\$\w+|[A-Za-z_]\w*|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|-?(?:\d+\.\d*|\.\d+|\d+)|true|false|null",
+                        argument, re.I,
+                    )
+                    for index, argument in enumerate(arguments)
+                ):
+                    return None
+                return {
+                    "parameter": parameter_match.group(1),
+                    "kind": "transformed",
+                    "category": transformation_category(call.group(1)),
+                    "transform_name": call.group(1),
+                    "expression": expression,
+                }
+            if not allow_helper_call:
+                return None
+            parameter_arguments = [
+                index for index, argument in enumerate(arguments)
+                if re.fullmatch(r"\$(\w+)", argument)
+                and re.fullmatch(r"\$(\w+)", argument).group(1) in params
+            ]
+            if len(parameter_arguments) != 1:
+                return None
+            parameter_index = parameter_arguments[0]
+            parameter = re.fullmatch(r"\$(\w+)", arguments[parameter_index]).group(1)
+            if not all(
+                index == parameter_index or re.fullmatch(
+                    r"\$\w+|[A-Za-z_]\w*|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|-?(?:\d+\.\d*|\.\d+|\d+)|true|false|null",
+                    argument, re.I,
+                )
+                for index, argument in enumerate(arguments)
+            ):
+                return None
+            return {
+                "parameter": parameter,
+                "kind": "helper-call",
+                "category": None,
+                "transform_name": call.group(1),
+                "expression": expression,
+            }
+
+        def summarize_switch_branches():
+            meaningful = [
+                (line_number, text.strip())
+                for line_number, text in body_lines
+                if text.strip() and not text.strip().startswith(("//", "#", "*"))
+            ]
+            if not meaningful:
+                return None
+            switch_index = 0
+            while switch_index < len(meaningful) and re.fullmatch(
+                r"(?:include|include_once|require|require_once)\s*\(?\s*['\"][^'\"]+\.php['\"]\s*\)?\s*;",
+                meaningful[switch_index][1], re.I,
+            ):
+                switch_index += 1
+            if switch_index == len(meaningful):
+                return None
+            switch = re.fullmatch(r"switch\s*\((.+)\)\s*(\{)?", meaningful[switch_index][1])
+            if not switch:
+                return None
+            switch_expression = switch.group(1).strip()
+            supported_switch_expression = (
+                re.fullmatch(r"\$\w+", switch_expression)
+                or re.fullmatch(r"\$_COOKIE\s*\[\s*['\"][^'\"]+['\"]\s*\]", switch_expression)
+            )
+            if not supported_switch_expression:
+                return None, "unsupported switch condition", (file, meaningful[0][0], meaningful[0][1])
+            content_start = switch_index + 1
+            if not switch.group(2):
+                if len(meaningful) <= switch_index + 1 or meaningful[switch_index + 1][1] != "{":
+                    return None, "unsupported switch block syntax", (file, meaningful[switch_index][0], meaningful[switch_index][1])
+                content_start = switch_index + 2
+            closing_index = next(
+                (index for index in range(content_start, len(meaningful)) if meaningful[index][1] == "}"),
+                None,
+            )
+            if closing_index is None:
+                return None, "unterminated switch block", (file, meaningful[0][0], meaningful[0][1])
+            cases = []
+            active_case = None
+            for line_number, text in meaningful[content_start:closing_index]:
+                label = re.fullmatch(r"case\s+(.+?)\s*:", text, re.I)
+                default = re.fullmatch(r"default\s*:", text, re.I)
+                if label or default:
+                    if active_case is not None:
+                        cases.append(active_case)
+                    condition = "default" if default else label.group(1).strip()
+                    if condition != "default" and not re.fullmatch(
+                        r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|-?(?:\d+\.\d*|\.\d+|\d+)|true|false|null",
+                        condition,
+                        re.I,
+                    ):
+                        return None, "unsupported switch case label", (file, line_number, text)
+                    active_case = {"condition": condition, "line": line_number, "statements": []}
+                elif active_case is None:
+                    return None, "statement outside a supported switch branch", (file, line_number, text)
+                else:
+                    active_case["statements"].append((line_number, text))
+            if active_case is not None:
+                cases.append(active_case)
+            if len(cases) < 2 or sum(case["condition"] == "default" for case in cases) != 1:
+                return None, "switch branches must include distinct cases and one default", (file, meaningful[0][0], meaningful[0][1])
+            if len({case["condition"] for case in cases}) != len(cases):
+                return None, "duplicate switch branch labels", (file, meaningful[0][0], meaningful[0][1])
+
+            branch_values = []
+            common_return = None
+            assignment_style = None
+            for case in cases:
+                statements = case["statements"]
+                if len(statements) == 1:
+                    direct_return = re.fullmatch(r"return\s+(.+?)\s*;", statements[0][1])
+                    if direct_return:
+                        if assignment_style is True:
+                            return None, "mixed switch return styles", (file, statements[0][0], statements[0][1])
+                        assignment_style = False
+                        value = summarize_return_expression(
+                            direct_return.group(1), allow_helper_call=True
+                        )
+                        if value is None:
+                            return None, "unsupported switch return expression", (file, statements[0][0], statements[0][1])
+                        branch_values.append((case, value, statements[0][0]))
+                        continue
+                if len(statements) == 2:
+                    assignment = re.fullmatch(r"\$(\w+)\s*=\s*(.+?)\s*;", statements[0][1])
+                    if assignment and statements[1][1] == "break;":
+                        if assignment_style is False:
+                            return None, "mixed switch return styles", (file, statements[0][0], statements[0][1])
+                        assignment_style = True
+                        destination, expression = assignment.groups()
+                        if destination not in params:
+                            return None, "switch branch reassigns an unsupported local", (file, statements[0][0], statements[0][1])
+                        value = summarize_return_expression(
+                            expression, allow_helper_call=True
+                        )
+                        if value is None or value["parameter"] != destination:
+                            return None, "unsupported switch branch assignment", (file, statements[0][0], statements[0][1])
+                        branch_values.append((case, value, statements[0][0]))
+                        continue
+                return None, "unsupported switch branch statements", (file, statements[0][0] if statements else case["line"], statements[0][1] if statements else "empty branch")
+
+            tail = meaningful[closing_index + 1:]
+            if assignment_style:
+                if len(tail) != 1:
+                    return None, "switch branches require one shared return", (file, meaningful[closing_index][0], meaningful[closing_index][1])
+                result = re.fullmatch(r"return\s+\$(\w+)\s*;", tail[0][1])
+                if not result or any(
+                    case_value["parameter"] != result.group(1)
+                    for _, case_value, _ in branch_values
+                ):
+                    return None, "switch branches do not share a supported return", (file, tail[0][0], tail[0][1])
+                return_line = tail[0][0]
+            else:
+                if tail:
+                    return None, "unsupported statements after switch returns", (file, tail[0][0], tail[0][1])
+                return_line = None
+            return {
+                "file": file,
+                "definition_line": start_line,
+                "params": params,
+                "required_count": required_count,
+                "switch_expression": switch_expression,
+                "prelude": [
+                    (file, line_number, text)
+                    for line_number, text in meaningful[:switch_index]
+                ],
+                "branch_paths": [
+                    {
+                        **value,
+                        "condition": case["condition"],
+                        "branch_line": case["line"],
+                        "return_line": expression_line,
+                        "shared_return_line": return_line,
+                    }
+                    for case, value, expression_line in branch_values
+                ],
+            }, None, None
+
+        branch_summary = summarize_switch_branches()
+        if (
+            isinstance(branch_summary, tuple)
+            and branch_summary
+            and isinstance(branch_summary[0], dict)
+        ):
+            return branch_summary
+
+        executable_body = [
+            (line_number, text.strip())
+            for line_number, text in body_lines
+            if text.strip() and not text.strip().startswith(("//", "#", "*"))
+        ]
+        if len(executable_body) == 1:
+            line_number, statement = executable_body[0]
+            direct_return = re.fullmatch(r"return\s+(.+?)\s*;", statement)
+            returned_expression = (
+                summarize_return_expression(direct_return.group(1))
+                if direct_return else None
+            )
+            if returned_expression and returned_expression["kind"] == "transformed":
+                return {
+                    "file": file,
+                    "definition_line": start_line,
+                    "params": params,
+                    "required_count": required_count,
+                    "parameter": returned_expression["parameter"],
+                    "return_variable": returned_expression["parameter"],
+                    "aliases": [],
+                    "return_line": line_number,
+                    "return_kind": "transformed",
+                    "return_category": returned_expression["category"],
+                    "return_expression": direct_return.group(1).strip(),
+                }, None, None
+
         aliases = {}
         alias_lines = []
         return_value = None
@@ -1835,7 +2679,7 @@ def _trace_php_flow(path, source, reports_dir):
             if not statement or statement.startswith(("//", "#", "*")):
                 continue
             alias = re.fullmatch(r"\s*\$(\w+)\s*=\s*\$(\w+)\s*;\s*", body_text)
-            result = re.fullmatch(r"\s*return\s+\$(\w+)\s*;\s*", body_text)
+            result = re.fullmatch(r"\s*return\s+(.+?)\s*;\s*", body_text)
             if alias and return_line is None:
                 destination, source = alias.groups()
                 if source not in params and source not in aliases:
@@ -1859,12 +2703,35 @@ def _trace_php_flow(path, source, reports_dir):
                 line_number, excerpt = start_line, "function has no supported unconditional return"
             return reject("function must have exactly one unconditional return", line_number, excerpt)
         return_source = returned[0][1]
-        if return_source in params:
-            parameter = return_source
-        elif return_source in aliases:
-            parameter = aliases[return_source]
+        returned_variable = re.fullmatch(r"\$(\w+)", return_source)
+        if returned_variable and returned_variable.group(1) in params:
+            parameter = returned_variable.group(1)
+        elif returned_variable and returned_variable.group(1) in aliases:
+            parameter = aliases[returned_variable.group(1)]
         else:
-            return reject("return value is not a supported parameter or alias", returned[0][0], f"return ${return_source};")
+            transformed_return = summarize_return_expression(return_source)
+            if not transformed_return or transformed_return["kind"] != "transformed":
+                return reject("return value is not a supported parameter, alias, or recognized transform", returned[0][0], f"return {return_source};")
+            parameter = transformed_return["parameter"]
+            if params.index(parameter) >= required_count:
+                return reject(
+                    "return value depends on an optional parameter",
+                    returned[0][0],
+                    f"return {return_source};",
+                )
+            return {
+                "file": file,
+                "definition_line": start_line,
+                "params": params,
+                "required_count": required_count,
+                "parameter": parameter,
+                "return_variable": parameter,
+                "aliases": alias_lines,
+                "return_line": returned[0][0],
+                "return_kind": "transformed",
+                "return_category": transformed_return["category"],
+                "return_expression": return_source,
+            }, None, None
         if params.index(parameter) >= required_count:
             return reject(
                 "return value depends on an optional parameter",
@@ -1877,7 +2744,7 @@ def _trace_php_flow(path, source, reports_dir):
             "params": params,
             "required_count": required_count,
             "parameter": parameter,
-            "return_variable": return_source,
+            "return_variable": parameter,
             "aliases": alias_lines,
             "return_line": return_line,
         }, None, None
@@ -1982,6 +2849,49 @@ def _trace_php_flow(path, source, reports_dir):
             return []
         return split_top_level_list(arguments)
 
+    def validate_branch_return_path(branch_path):
+        if branch_path["kind"] == "identity":
+            return "identity"
+        call = re.fullmatch(
+            r"([A-Za-z_]\w*)\s*\((.*)\)", branch_path["expression"]
+        )
+        if not call:
+            return None
+        transform_name = call.group(1).lower()
+        arguments = split_call_arguments(call.group(2))
+        builtin_transforms = {
+            "addslashes", "htmlentities", "htmlspecialchars",
+            "mysql_real_escape_string", "mysqli_real_escape_string",
+            "escapeshellarg", "escapeshellcmd",
+            "basename", "realpath",
+        }
+        if transform_name in builtin_transforms:
+            if sum(argument == f"${branch_path['parameter']}" for argument in arguments) == 1:
+                return transformation_category(transform_name)
+            return None
+        candidates = [
+            candidate for candidate in function_summaries.get(transform_name, [])
+            if candidate[1] == root_file or candidate[1] in visited
+        ]
+        if len(candidates) != 1 or candidates[0][0] is None:
+            return None
+        transform_summary = candidates[0][0]
+        if transform_summary.get("branch_paths"):
+            return None
+        if (
+            len(arguments) < transform_summary["required_count"]
+            or len(arguments) > len(transform_summary["params"])
+        ):
+            return None
+        parameter_index = transform_summary["params"].index(
+            transform_summary["parameter"]
+        )
+        if parameter_index >= len(arguments) or arguments[parameter_index] != f"${branch_path['parameter']}":
+            return None
+        if transform_summary.get("return_kind") == "transformed":
+            return transform_summary.get("return_category", "other-transformation")
+        return "identity"
+
     def split_sink_arguments(arguments):
         pieces, start, depth, quote, escaped = [], 0, 0, None, False
         for index, char in enumerate(arguments):
@@ -2015,6 +2925,30 @@ def _trace_php_flow(path, source, reports_dir):
                 start += 1
             expression = line[start:].split(";", 1)[0]
             return re.sub(r"\?>\s*$", "", expression).strip()
+        dangerous = re.fullmatch(
+            r"Dangerous server-side operation: ([A-Za-z_][A-Za-z0-9_]*)",
+            sink_type,
+        )
+        if dangerous:
+            function_name = dangerous.group(1)
+            match = re.search(
+                rf"(?<!->)\b{re.escape(function_name)}\s*\(", code_line, re.I
+            )
+            if not match:
+                return None
+            opening = code_line.find("(", match.start(), match.end())
+            depth = 1
+            closing = opening + 1
+            while closing < len(code_line) and depth:
+                if code_line[closing] == "(":
+                    depth += 1
+                elif code_line[closing] == ")":
+                    depth -= 1
+                closing += 1
+            if depth:
+                return None
+            arguments = split_sink_arguments(line[opening + 1:closing - 1])
+            return arguments[0] if arguments else None
         match = re.search(
             r"\b(mysqli_query|mysqli_multi_query|mysql_query|pg_query|sqlite_query)\s*\(|->\s*(query|exec|prepare)\s*\(",
             code_line,
@@ -2212,6 +3146,36 @@ def _trace_php_flow(path, source, reports_dir):
             summary_entry = available_candidates[0] if available_candidates else None
             summary = summary_entry[0] if summary_entry else None
             reason = None
+            builtin_transform_category = (
+                transformation_category(name)
+                if call["kind"] == "function"
+                and name.lower() in {
+                    "escapeshellarg", "escapeshellcmd", "basename", "realpath",
+                }
+                else None
+            )
+            if builtin_transform_category:
+                if len(arguments) != 1 or not supported_call_argument(arguments[0]):
+                    reason = "recognized transformation requires one supported argument"
+                else:
+                    parameter_name = (
+                        re.fullmatch(r"\$(\w+)", arguments[0])
+                    )
+                    summary = {
+                        "params": [parameter_name.group(1) if parameter_name else "value"],
+                        "required_count": 1,
+                        "parameter": parameter_name.group(1) if parameter_name else "value",
+                        "return_variable": parameter_name.group(1) if parameter_name else "value",
+                        "return_line": call_line,
+                        "aliases": [],
+                        "return_kind": "transformed",
+                        "return_expression": f"{name}({arguments[0]})",
+                        "return_category": builtin_transform_category,
+                        "file": file,
+                        "definition_line": call_line,
+                        "built_in_transform": True,
+                    }
+                    summary_entry = (summary, file, call_line, "built-in transform", None)
             if call["kind"] == "constructor":
                 reason = "constructor behavior is not summarized"
             elif call["kind"] != "function":
@@ -2245,46 +3209,115 @@ def _trace_php_flow(path, source, reports_dir):
                 for method, key in input_pattern.findall(raw_arguments):
                     unresolved_refs.append((method, key, file, number, expression))
             else:
-                returned_argument_index = summary["params"].index(summary["parameter"])
-                if returned_argument_index >= len(arguments):
-                    reason = "return value depends on an optional parameter that was omitted"
-                    unresolved_calls.append((name, file, call_line, reason, call_column, call["kind"]))
-                    for method, key in input_pattern.findall(raw_arguments):
-                        unresolved_refs.append((method, key, file, number, expression))
-                    for index in range(call["start"], call["end"]):
-                        base_chars[index] = " "
-                    continue
-                returned_argument = arguments[returned_argument_index]
-                records = []
-                inherited_edges = []
-                argument_variable = re.fullmatch(r"\$(\w+)", returned_argument)
-                argument_input = input_pattern.fullmatch(returned_argument)
-                if argument_variable:
-                    variable = argument_variable.group(1)
-                    records.extend(origins.get(variable, []))
-                    inherited_edges.extend(edges.get(variable, []))
-                elif argument_input:
-                    method, key = argument_input.groups()
-                    records.append((method.upper(), key, file, number))
-                    if not diagnostic_only:
-                        inputs.append((method.upper(), key, file, number, expression))
-                if records:
-                    event = (
-                        "function",
-                        file,
-                        number,
-                        name,
-                        summary["file"],
-                        summary["definition_line"],
-                        summary["parameter"],
-                        returned_argument,
-                        summary["return_line"],
-                        tuple(summary["aliases"]),
-                        summary["return_variable"],
-                    )
-                    call_results.extend(records)
-                    call_edges.extend(inherited_edges)
-                    call_edges.append(event)
+                branch_paths = summary.get("branch_paths")
+                paths = branch_paths or [{
+                    "parameter": summary["parameter"],
+                    "kind": "identity",
+                    "expression": f"${summary['return_variable']}",
+                    "return_line": summary["return_line"],
+                }]
+                if branch_paths:
+                    resolved_paths = []
+                    for branch_path in paths:
+                        resolved_kind = validate_branch_return_path(branch_path)
+                        if resolved_kind is None:
+                            reason = (
+                                "branch return expression "
+                                f"{branch_path['expression']} is not a uniquely summarized identity or recognized transform"
+                            )
+                            break
+                        resolved_paths.append({**branch_path, "resolved_kind": resolved_kind})
+                    if reason:
+                        unresolved_calls.append((name, file, call_line, reason, call_column, call["kind"]))
+                        for method, key in input_pattern.findall(raw_arguments):
+                            unresolved_refs.append((method, key, file, number, expression))
+                    else:
+                        paths = resolved_paths
+                for branch_path in paths:
+                    if reason:
+                        break
+                    returned_argument_index = summary["params"].index(branch_path["parameter"])
+                    if returned_argument_index >= len(arguments):
+                        reason = "return value depends on an optional parameter that was omitted"
+                        unresolved_calls.append((name, file, call_line, reason, call_column, call["kind"]))
+                        for method, key in input_pattern.findall(raw_arguments):
+                            unresolved_refs.append((method, key, file, number, expression))
+                        continue
+                    returned_argument = arguments[returned_argument_index]
+                    records = []
+                    inherited_edges = []
+                    argument_variable = re.fullmatch(r"\$(\w+)", returned_argument)
+                    argument_input = input_pattern.fullmatch(returned_argument)
+                    if argument_variable:
+                        variable = argument_variable.group(1)
+                        records.extend(origins.get(variable, []))
+                        inherited_edges.extend(edges.get(variable, []))
+                    elif argument_input:
+                        method, key = argument_input.groups()
+                        records.append((method.upper(), key, file, number))
+                        if not diagnostic_only:
+                            inputs.append((method.upper(), key, file, number, expression))
+                    if records:
+                        if branch_paths:
+                            event = (
+                                "function-branch",
+                                file,
+                                number,
+                                name,
+                                summary["file"],
+                                summary["definition_line"],
+                                summary["switch_expression"],
+                                branch_path["condition"],
+                                branch_path["branch_line"],
+                                branch_path["return_line"],
+                                branch_path.get("shared_return_line"),
+                                branch_path["parameter"],
+                                returned_argument,
+                                branch_path["resolved_kind"],
+                                branch_path["expression"],
+                                tuple(summary.get("prelude", [])),
+                            )
+                        elif summary.get("built_in_transform"):
+                            event = (
+                                "builtin-transformed",
+                                file,
+                                call_line,
+                                name,
+                                returned_argument,
+                                summary["return_expression"],
+                                summary["return_category"],
+                            )
+                        elif summary.get("return_kind") == "transformed":
+                            event = (
+                                "function-transformed",
+                                file,
+                                number,
+                                name,
+                                summary["file"],
+                                summary["definition_line"],
+                                summary["parameter"],
+                                returned_argument,
+                                summary["return_line"],
+                                summary["return_expression"],
+                                summary.get("return_category", "other-transformation"),
+                            )
+                        else:
+                            event = (
+                                "function",
+                                file,
+                                number,
+                                name,
+                                summary["file"],
+                                summary["definition_line"],
+                                summary["parameter"],
+                                returned_argument,
+                                summary["return_line"],
+                                tuple(summary["aliases"]),
+                                summary["return_variable"],
+                            )
+                        call_results.extend(records)
+                        call_edges.extend(inherited_edges)
+                        call_edges.append(event)
             if call["end"] is not None:
                 for index in range(call["start"], call["end"]):
                     base_chars[index] = " "
@@ -2356,7 +3389,7 @@ def _trace_php_flow(path, source, reports_dir):
                 f"  Unresolved function-call expression at {file.name}:{number}: {expression}"
             )
 
-    def trace_sink_expression(line, code_line, file, number, sink_type, conditional=False):
+    def trace_sink_expression(line, code_line, file, number, sink_type, conditional=False, active_guards=None):
         expression = sink_expression(line, code_line, sink_type)
         if expression is None:
             return [], [], [], [], [], False
@@ -2391,6 +3424,8 @@ def _trace_php_flow(path, source, reports_dir):
         ]
         if call_records:
             snapshot.append(("$function_result", call_records, call_edges))
+        if active_guards:
+            snapshot.append(("$guard", [], guard_edges(active_guards)))
         return direct, tracked, invalidated_refs, snapshot, call_records, False
 
     def mask_output_comments(expression):
@@ -2491,6 +3526,67 @@ def _trace_php_flow(path, source, reports_dir):
             return
         record_call_uncertainty(unresolved_calls, file, number, expression)
 
+    def simple_if_condition(text):
+        match = re.fullmatch(r"if\s*\((.+)\)\s*(\{)?", text)
+        if not match:
+            return None, False
+        condition = match.group(1).strip()
+        if not condition or any(char in condition for char in "{};"):
+            return None, False
+        return condition, bool(match.group(2))
+
+    def guard_edges(guards):
+        return [
+            ("guard", file, line, condition, arm)
+            for file, line, condition, arm in guards
+        ]
+
+    def merge_guarded_branch(frame, left_origins, left_edges, right_origins, right_edges, file, number):
+        names = set(left_origins) | set(right_origins)
+        merged_origins = {}
+        merged_edges = {}
+        for name in names:
+            left = left_origins.get(name, [])
+            right = right_origins.get(name, [])
+            left_keys = {(record[0], record[1], record[2], record[3]) for record in left}
+            right_keys = {(record[0], record[1], record[2], record[3]) for record in right}
+            if left_keys == right_keys:
+                if left_keys:
+                    merged_origins[name] = list(dict.fromkeys(left + right))
+                    merged_edges[name] = list(dict.fromkeys(
+                        left_edges.get(name, []) + right_edges.get(name, [])
+                    ))
+            elif left_keys or right_keys or name in frame["changed"]:
+                invalidated[name] = (file, number)
+                unresolved.append(
+                    f"  Unresolved conditional join for ${name} at {file.name}:{number}: branch provenance differs or is incomplete."
+                )
+        return merged_origins, merged_edges
+
+    def call_arguments_from_line(line, code_line, match):
+        opening = code_line.find("(", match.start(), match.end())
+        if opening < 0:
+            return None
+        depth, closing = 1, opening + 1
+        while closing < len(code_line) and depth:
+            if code_line[closing] == "(":
+                depth += 1
+            elif code_line[closing] == ")":
+                depth -= 1
+            closing += 1
+        if depth:
+            return None
+        return split_call_arguments(line[opening + 1:closing - 1])
+
+    def current_guard_context(frame, file, number, text):
+        if frame is None or frame["unsupported"]:
+            return []
+        guards = list(frame["guards"])
+        condition, _ = simple_if_condition(text)
+        if condition is not None:
+            guards.append((file, number, condition, "then"))
+        return guards
+
     def visit(file):
         file = file.resolve()
         if file in active:
@@ -2501,11 +3597,17 @@ def _trace_php_flow(path, source, reports_dir):
         active.append(file)
         visited.add(file)
         try:
-            lines = file.read_text(errors="ignore").splitlines()
+            source_text = file.read_text(errors="ignore")
+            lines = source_text.splitlines()
         except OSError:
             active.pop()
             return
         source_lines_by_file[file] = lines
+        source_text_by_file[file] = source_text
+        form_controls.extend(static_form_controls(file, "\n".join(lines)))
+        pending_sql_statements = {}
+        prepared_query_sources = {}
+        prepared_statements = {}
         depth = 0
         lexical_state = {
             "php": False,
@@ -2521,8 +3623,248 @@ def _trace_php_flow(path, source, reports_dir):
             number = line_index + 1
             text = line.strip()
             code_line = code_lines[line_index]
+            if conditional_frame is not None and conditional_frame["unsupported"]:
+                unsupported_source_lines.add((file.resolve(), number))
+            guards_by_source_line[(file.resolve(), number)] = current_guard_context(
+                conditional_frame, file, number, text
+            )
             if number in function_ranges.get(file, set()):
                 continue
+            statement_match = sql_statement_pattern.match(text)
+            if statement_match and code_line.strip():
+                variable, _, operation = statement_match.groups()
+                operation = operation.upper()
+                pending_sql_statements.setdefault(variable, []).append((operation, number))
+                action = "retrieval" if operation == "SELECT" else "write"
+                database_observations.append((
+                    f"Database {action} statement construction ({operation})",
+                    file, number, text,
+                ))
+                literal_match = re.fullmatch(
+                    r"\s*\$\w+\s*=\s*(['\"])(.*?)\1\s*;\s*", text
+                )
+                if literal_match and "\\" not in literal_match.group(2):
+                    prepared_query_sources[variable] = {
+                        "operation": operation,
+                        "query_line": number,
+                        "query_text": text,
+                        "placeholder_count": literal_match.group(2).count("?"),
+                        "guards": current_guard_context(
+                            conditional_frame, file, number, text
+                        ),
+                        "supported": True,
+                    }
+                else:
+                    prepared_query_sources[variable] = {
+                        "operation": operation,
+                        "query_line": number,
+                        "query_text": text,
+                        "placeholder_count": None,
+                        "guards": current_guard_context(
+                            conditional_frame, file, number, text
+                        ),
+                        "supported": False,
+                    }
+            query_match = re.search(r"->\s*(?:query|exec)\s*\(\s*\$(\w+)", code_line, re.I)
+            if query_match:
+                variable = query_match.group(1)
+                statements = pending_sql_statements.pop(variable, [])
+                operations = {operation for operation, _ in statements}
+                if operations:
+                    operation_label = next(iter(operations)) if len(operations) == 1 else "operation unresolved"
+                    action = "retrieval" if operations == {"SELECT"} else "write" if operations <= {"INSERT", "UPDATE", "DELETE"} else "query"
+                    database_observations.append((
+                        f"Database {action} execution ({operation_label}) using ${variable}; statement construction line(s) "
+                        + (", ".join(str(statement_line) for _, statement_line in statements) or "unknown"),
+                        file, number, text,
+                    ))
+
+            prepare_match = re.search(
+                r"\$(\w+)\s*=\s*\$\w+\s*->\s*prepare\s*\(\s*\$(\w+)\s*\)",
+                code_line,
+                re.I,
+            )
+            if prepare_match:
+                statement_variable, query_variable = prepare_match.groups()
+                query_source = prepared_query_sources.get(query_variable)
+                statement = {
+                    "file": file,
+                    "statement_variable": statement_variable,
+                    "query_variable": query_variable,
+                    "prepare_line": number,
+                    "prepare_text": text,
+                    "prepare_guards": current_guard_context(
+                        conditional_frame, file, number, text
+                    ),
+                    "query": dict(query_source) if query_source else None,
+                    "bindings": [],
+                    "execute_lines": [],
+                    "unresolved": None,
+                }
+                if statement_variable in prepared_statements:
+                    statement["unresolved"] = (
+                        "statement variable is prepared more than once; query mapping is ambiguous"
+                    )
+                    prepared_statements[statement_variable]["unresolved"] = statement["unresolved"]
+                    unresolved.append(
+                        f"  Unresolved prepared-statement mapping at {file.name}:{number}: ${statement_variable} is prepared more than once."
+                    )
+                elif not query_source:
+                    statement["unresolved"] = (
+                        f"no supported static query assignment for ${query_variable}"
+                    )
+                    unresolved.append(
+                        f"  Unresolved prepared-statement query at {file.name}:{number}: no supported static query assignment for ${query_variable}."
+                    )
+                elif not query_source["supported"]:
+                    statement["unresolved"] = (
+                        "query expression is not one supported static string literal"
+                    )
+                    unresolved.append(
+                        f"  Unresolved prepared-statement query at {file.name}:{query_source['query_line']}: query expression is not one supported static string literal."
+                    )
+                elif query_source["placeholder_count"] < 1:
+                    statement["unresolved"] = "query has no supported positional placeholders"
+                    unresolved.append(
+                        f"  Unresolved prepared-statement query at {file.name}:{query_source['query_line']}: no positional placeholder was observed."
+                    )
+                elif conditional_frame is not None and conditional_frame["unsupported"]:
+                    statement["unresolved"] = "prepare call is inside unsupported conditional control flow"
+                    unresolved.append(
+                        f"  Unresolved prepared-statement prepare call at {file.name}:{number}: enclosing conditional control flow is unsupported."
+                    )
+                prepared_statements[statement_variable] = statement
+                prepared_statement_observations.append(statement)
+
+            bind_match = re.search(
+                r"\$(\w+)\s*->\s*bind_param\s*\(", code_line, re.I
+            )
+            if bind_match:
+                statement_variable = bind_match.group(1)
+                statement = prepared_statements.get(statement_variable)
+                arguments = call_arguments_from_line(line, code_line, bind_match)
+                reason = None
+                if statement is None:
+                    reason = "no unique supported prepare() call is associated with this statement variable"
+                elif statement["unresolved"]:
+                    reason = statement["unresolved"]
+                elif arguments is None or not arguments:
+                    reason = "bind_param() arguments are incomplete or unsupported"
+                else:
+                    type_match = re.fullmatch(r"(['\"])([idsb]+)\1", arguments[0])
+                    variables = arguments[1:]
+                    query = statement["query"]
+                    if not type_match:
+                        reason = "bind_param() type string is not a supported literal"
+                    elif any(not re.fullmatch(r"\$\w+", item) for item in variables):
+                        reason = "bind_param() includes an unsupported or ambiguous parameter expression"
+                    elif len(type_match.group(2)) != len(variables):
+                        reason = "bind_param() type and variable counts do not match"
+                    elif len(variables) != query["placeholder_count"]:
+                        reason = "bind_param() variable count does not match the query placeholder count"
+                if reason:
+                    if statement is not None:
+                        statement["unresolved"] = reason
+                    unresolved.append(
+                        f"  Unresolved prepared-statement binding at {file.name}:{number}: {reason}."
+                    )
+                elif conditional_frame is not None and conditional_frame["unsupported"]:
+                    statement["unresolved"] = "binding occurs inside unsupported conditional control flow"
+                    unresolved.append(
+                        f"  Unresolved prepared-statement binding at {file.name}:{number}: enclosing conditional control flow is unsupported."
+                    )
+                elif depth > 0 and conditional_frame is None:
+                    statement["unresolved"] = "binding occurs inside unsupported enclosing control flow"
+                    unresolved.append(
+                        f"  Unresolved prepared-statement binding at {file.name}:{number}: enclosing control flow is unsupported."
+                    )
+                else:
+                    variables = arguments[1:]
+                    if statement["bindings"]:
+                        statement["unresolved"] = "multiple bind_param() calls create an ambiguous parameter mapping"
+                        unresolved.append(
+                            f"  Unresolved prepared-statement binding at {file.name}:{number}: multiple bind_param() calls create an ambiguous parameter mapping."
+                        )
+                    else:
+                        statement["bindings"] = [
+                            {
+                                "position": index + 1,
+                                "type": type_match.group(2)[index],
+                                "variable": item[1:],
+                                "line": number,
+                                "text": text,
+                                "records": list(origins.get(item[1:], [])),
+                                "edges": list(edges.get(item[1:], [])),
+                                "guards": current_guard_context(
+                                    conditional_frame, file, number, text
+                                ),
+                                "invalidated": item[1:] in invalidated,
+                            }
+                            for index, item in enumerate(variables)
+                        ]
+
+            execute_match = re.search(
+                r"\$(\w+)\s*->\s*execute\s*\(", code_line, re.I
+            )
+            if execute_match:
+                statement_variable = execute_match.group(1)
+                statement = prepared_statements.get(statement_variable)
+                arguments = call_arguments_from_line(line, code_line, execute_match)
+                reason = None
+                if statement is None:
+                    reason = "no unique supported prepare() call is associated with this statement variable"
+                elif statement["unresolved"]:
+                    reason = statement["unresolved"]
+                elif arguments is None or arguments:
+                    reason = "execute() arguments are unsupported; parameter mapping cannot be established"
+                elif conditional_frame is not None and conditional_frame["unsupported"]:
+                    reason = "execute() occurs inside unsupported conditional control flow"
+                elif depth > 0 and conditional_frame is None:
+                    reason = "execute() occurs inside unsupported enclosing control flow"
+                else:
+                    expected = statement["query"]["placeholder_count"]
+                    if len(statement["bindings"]) != expected:
+                        reason = "observed bindings do not cover every query placeholder exactly once"
+                if reason:
+                    unresolved.append(
+                        f"  Unresolved prepared-statement execution at {file.name}:{number}: {reason}."
+                    )
+                    if statement is not None:
+                        statement["unresolved"] = reason
+                else:
+                    execution_guards = current_guard_context(
+                        conditional_frame, file, number, text
+                    )
+                    statement["execute_lines"].append((number, text, execution_guards))
+                    operation = statement["query"]["operation"]
+                    database_observations.append((
+                        f"Database prepared statement execution ({operation}) using ${statement_variable}; "
+                        f"query construction line {statement['query']['query_line']}; binding line(s) "
+                        + ", ".join(str(binding["line"]) for binding in statement["bindings"]),
+                        file, number, text,
+                    ))
+                    sink_observations.append((
+                        "SQL/prepared statement execution", file, number,
+                        text, " [conditional context; flow not established]" if execution_guards else "",
+                    ))
+                    for binding in statement["bindings"]:
+                        if binding["invalidated"]:
+                            unresolved.append(
+                                f"  Unresolved prepared-statement source at {file.name}:{binding['line']}: ${binding['variable']} provenance was invalidated before binding."
+                            )
+                            continue
+                        if binding["records"]:
+                            prepared_statement_flows.append({
+                                "statement": statement,
+                                "binding": binding,
+                                "execute_line": number,
+                                "execute_text": text,
+                                "guards": list(dict.fromkeys(
+                                    statement["prepare_guards"]
+                                    + binding["guards"]
+                                    + execution_guards
+                                )),
+                            })
             branch = bool(re.match(r"(?:if|else|elseif|switch|for|foreach|while|function|try|catch)\b", text))
             conditional_context = branch or depth > 0
             observed_sinks = []
@@ -2534,6 +3876,15 @@ def _trace_php_flow(path, source, reports_dir):
                 observed_sinks.append("SQL/query")
             if re.search(r"\b(?:echo|print|printf)\b", code_line):
                 observed_sinks.append("output")
+            for operation_name in dangerous_operation_names:
+                if re.search(
+                    rf"(?<!->)\b{re.escape(operation_name)}\s*\(",
+                    code_line,
+                    re.I,
+                ):
+                    observed_sinks.append(
+                        f"Dangerous server-side operation: {operation_name}"
+                    )
             excerpt = text if len(text) <= 200 else text[:197] + "..."
             for sink_type in observed_sinks:
                 context = " [conditional context; flow not established]" if conditional_context else ""
@@ -2550,6 +3901,7 @@ def _trace_php_flow(path, source, reports_dir):
                 and lines[line_index + 1].strip() == "{"
             )
             if conditional_frame is None and (simple_if or next_line_if):
+                outer_condition, _ = simple_if_condition(text)
                 conditional_frame = {
                     "entry_origins": {key: list(value) for key, value in origins.items()},
                     "entry_edges": {key: list(value) for key, value in edges.items()},
@@ -2561,6 +3913,8 @@ def _trace_php_flow(path, source, reports_dir):
                     "changed": {},
                     "flow_sink_start": len(sinks),
                     "opening_brace_line": line_index + 1 if next_line_if else None,
+                    "nested_blocks": [],
+                    "guards": [(file, number, outer_condition or text, "then")],
                 }
                 depth += 1
                 continue
@@ -2570,6 +3924,121 @@ def _trace_php_flow(path, source, reports_dir):
                 if frame["opening_brace_line"] == line_index and text == "{":
                     frame["opening_brace_line"] = None
                     continue
+                nested_blocks = frame["nested_blocks"]
+                if nested_blocks and nested_blocks[-1].get("waiting_open") and text == "{":
+                    nested_blocks[-1]["waiting_open"] = False
+                    frame["depth"] += code_line.count("{") - code_line.count("}")
+                    depth += line.count("{") - line.count("}")
+                    continue
+
+                nested_condition, has_open_brace = simple_if_condition(text)
+                if nested_condition is not None and frame["depth"] >= 1:
+                    if nested_blocks:
+                        if not frame["unsupported"]:
+                            unresolved.append(
+                                f"  Unresolved unsupported conditional structure at {file.name}:{number}: {text}"
+                            )
+                            del sinks[frame["flow_sink_start"]:]
+                        frame["unsupported"] = True
+                    else:
+                        nested_blocks.append({
+                            "condition": nested_condition,
+                            "condition_file": file,
+                            "condition_line": number,
+                            "phase": "then",
+                            "waiting_open": not has_open_brace,
+                            "entry_origins": {key: list(value) for key, value in origins.items()},
+                            "entry_edges": {key: list(value) for key, value in edges.items()},
+                            "then_origins": None,
+                            "then_edges": None,
+                            "changed_before": set(frame["changed"]),
+                        })
+                        frame["guards"].append((file, number, nested_condition, "then"))
+                    frame["depth"] += code_line.count("{") - code_line.count("}")
+                    depth += line.count("{") - line.count("}")
+                    continue
+
+                if nested_blocks and nested_blocks[-1]["phase"] == "await_else" and text in {"else", "else {"}:
+                    nested = nested_blocks[-1]
+                    nested["phase"] = "else"
+                    nested["waiting_open"] = text == "else"
+                    frame["guards"].append((
+                        nested["condition_file"], nested["condition_line"],
+                        nested["condition"], "else (condition false)"
+                    ))
+                    frame["depth"] += code_line.count("{") - code_line.count("}")
+                    depth += line.count("{") - line.count("}")
+                    continue
+
+                if text == "}" and frame["depth"] > 1 and nested_blocks:
+                    nested = nested_blocks[-1]
+                    if nested["phase"] == "then":
+                        frame["guards"] = [
+                            guard for guard in frame["guards"]
+                            if not (guard[0] == file and guard[2] == nested["condition"] and guard[3] == "then")
+                        ]
+                        next_index = line_index + 1
+                        while next_index < len(lines) and not lines[next_index].strip():
+                            next_index += 1
+                        next_text = lines[next_index].strip() if next_index < len(lines) else ""
+                        if next_text in {"else", "else {"}:
+                            nested["phase"] = "await_else"
+                            nested["then_origins"] = {key: list(value) for key, value in origins.items()}
+                            nested["then_edges"] = {key: list(value) for key, value in edges.items()}
+                            origins.clear()
+                            origins.update({key: list(value) for key, value in nested["entry_origins"].items()})
+                            edges.clear()
+                            edges.update({key: list(value) for key, value in nested["entry_edges"].items()})
+                        else:
+                            changed = set(frame["changed"]) - nested["changed_before"]
+                            for name in changed:
+                                before = nested["entry_origins"].get(name, [])
+                                after = origins.get(name, [])
+                                before_keys = {(record[0], record[1], record[2], record[3]) for record in before}
+                                after_keys = {(record[0], record[1], record[2], record[3]) for record in after}
+                                if not before_keys and after_keys:
+                                    # This value is available only on the guarded branch;
+                                    # retain its origin with the guard edge attached.
+                                    continue
+                                if before_keys == after_keys:
+                                    origins[name] = list(dict.fromkeys(before + after))
+                                    edges[name] = list(dict.fromkeys(
+                                        nested["entry_edges"].get(name, []) + edges.get(name, [])
+                                    ))
+                                else:
+                                    origins.pop(name, None)
+                                    edges.pop(name, None)
+                                    invalidated[name] = (file, number)
+                                    unresolved.append(
+                                        f"  Unresolved conditional assignment at {file.name}:{number}: ${name} differs across the guarded branch."
+                                    )
+                            nested_blocks.pop()
+                    elif nested["phase"] == "else":
+                        frame["guards"] = [
+                            guard for guard in frame["guards"]
+                            if not (guard[0] == file and guard[2] == nested["condition"] and guard[3] == "else (condition false)")
+                        ]
+                        merged_origins, merged_edges = merge_guarded_branch(
+                            frame,
+                            nested["then_origins"] or {}, nested["then_edges"] or {},
+                            origins, edges, file, number,
+                        )
+                        origins.clear()
+                        origins.update(merged_origins)
+                        edges.clear()
+                        edges.update(merged_edges)
+                        nested_blocks.pop()
+                    else:
+                        if not frame["unsupported"]:
+                            unresolved.append(
+                                f"  Unresolved unsupported conditional structure at {file.name}:{number}: {text}"
+                            )
+                            del sinks[frame["flow_sink_start"]:]
+                        frame["unsupported"] = True
+                    frame["depth"] += code_line.count("{") - code_line.count("}")
+                    depth += line.count("{") - line.count("}")
+                    continue
+
                 if re.fullmatch(r"\}\s*else\s*\{", text) and frame["arm"] == "then" and frame["depth"] == 1:
                     frame["then_state"] = (
                         {key: list(value) for key, value in origins.items()},
@@ -2673,7 +4142,7 @@ def _trace_php_flow(path, source, reports_dir):
                     re.match(r"(?:if|elseif|else\s+if|else|switch|for|foreach|while|function|try|catch)\b", text)
                     or re.match(r"\}\s*(?:elseif|else\s+if)\b", text)
                 )
-                if nested_control or frame["depth"] > 1:
+                if nested_control or (frame["depth"] > 1 and not nested_blocks):
                     if not frame["unsupported"]:
                         unresolved.append(
                             f"  Unresolved unsupported conditional structure at {file.name}:{number}: {text}"
@@ -2726,11 +4195,13 @@ def _trace_php_flow(path, source, reports_dir):
                         edges.pop(dest, None)
                         if supported:
                             records, chain = prior + call_records, prior_edges + call_edges
+                            chain.extend(guard_edges(frame["guards"]))
                             if call_records:
                                 chain.append(("function-assignment", file, number, dest))
                             for method, key in direct:
                                 record = (method, key, file, number)
                                 records.append(record)
+                                chain.append(("source-assignment", file, number, dest, method, key))
                                 inputs.append((method, key, file, number, text + " [conditional branch]"))
                                 conditional_inputs.append((method, key, file, number, text))
                             for ref in refs:
@@ -2752,7 +4223,8 @@ def _trace_php_flow(path, source, reports_dir):
                     if observed_sinks:
                         for sink_type in observed_sinks:
                             direct, tracked, invalidated_refs, flow_snapshot, _, _ = trace_sink_expression(
-                                line, code_line, file, number, sink_type, conditional=True
+                                line, code_line, file, number, sink_type, conditional=True,
+                                active_guards=frame["guards"],
                             )
                             if direct or tracked or invalidated_refs or flow_snapshot:
                                 invalidated_snapshot = {
@@ -2863,6 +4335,7 @@ def _trace_php_flow(path, source, reports_dir):
                     for method, key in direct:
                         record = (method, key, file, number)
                         records.append(record)
+                        chain.append(("source-assignment", file, number, dest, method, key))
                         inputs.append((method, key, file, number, text))
                     for ref in refs:
                         records.extend(origins.get(ref, []))
@@ -2902,15 +4375,855 @@ def _trace_php_flow(path, source, reports_dir):
         except ValueError:
             return str(resolved_file)
 
+    def php_output_context_evidence(text, tracked_variables):
+        """Infer a narrow rendering context from static PHP output fragments."""
+        output = re.search(r"\b(?:echo|print|printf)\s+(.*?);?\s*$", text, re.I)
+        if not output:
+            return "unresolved", "output expression has no supported static template boundary"
+        expression = output.group(1).strip().rstrip(";").strip()
+        variables = sorted(
+            {"$" + name.lstrip("$") for name in tracked_variables if name != "$guard"},
+            key=len,
+            reverse=True,
+        )
+        variable_match = None
+        for variable in variables:
+            variable_match = re.search(re.escape(variable) + r"\b", expression)
+            if variable_match:
+                break
+        if variable_match is None:
+            variable_match = re.search(r"\$[A-Za-z_]\w*", expression)
+        if variable_match is None:
+            variable_match = re.search(r"\$_(?:GET|POST|REQUEST|COOKIE)\s*\[[^]]+\]", expression)
+        if variable_match is None:
+            return "unresolved", "traced value has no supported position within the output expression"
+
+        literal_pattern = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
+        prefix_parts, suffix_parts = [], []
+        for literal in literal_pattern.finditer(expression):
+            token = literal.group(0)
+            content = token[1:-1]
+            content = content.replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
+            if literal.end() <= variable_match.start():
+                prefix_parts.append(content)
+            elif literal.start() >= variable_match.end():
+                suffix_parts.append(content)
+        prefix, suffix = "".join(prefix_parts), "".join(suffix_parts)
+        lower_prefix = prefix.lower()
+        script_start = lower_prefix.rfind("<script")
+        script_end = lower_prefix.rfind("</script")
+        if script_start > script_end:
+            script_prefix = lower_prefix[script_start:]
+            if ((script_prefix.count('"') % 2) or (script_prefix.count("'") % 2)) and suffix:
+                return "JavaScript string", "bounded by static script markup and quote delimiters"
+            return "unresolved", "inside a script element, but a JavaScript string boundary is not established"
+
+        open_tag = prefix.rfind("<")
+        close_tag = prefix.rfind(">")
+        if open_tag > close_tag:
+            tag_prefix = prefix[open_tag:]
+            attribute = re.search(r"=\s*(['\"])[^'\"]*$", tag_prefix)
+            if attribute:
+                delimiter = attribute.group(1)
+                if suffix.startswith(delimiter):
+                    return "HTML attribute", "bounded by a quoted static attribute value"
+                return "unresolved", "inside an attribute-like region without a matching static closing quote"
+            return "unresolved", "inside an open HTML tag without a supported quoted attribute boundary"
+        if close_tag > open_tag and suffix.find("<") >= 0:
+            return "HTML text", "bounded by static HTML tag delimiters"
+        return "unresolved", "surrounding static markup does not establish a supported output context"
+
+    def is_resource_identifier(key):
+        return bool(re.search(
+            r"(?:^id$|_id$|Id$|^uuid$|_uuid$|Uuid$|^guid$|_guid$|Guid$)",
+            key,
+        ))
+
+    def is_authorization_like_guard(condition, tracked_variables):
+        # A principal/session check by itself may only establish login state.
+        # Require a comparison involving a variable in this traced flow, or a
+        # narrow locally visible helper whose parameter is compared to a
+        # principal/owner reference. This remains an observation, not proof.
+        variables = [re.escape(name.lstrip("$")) for name in tracked_variables]
+        tracked_reference = bool(variables) and re.search(
+            r"\$(?:" + "|".join(variables) + r")\b", condition
+        )
+        identity_reference = re.search(
+            r"\$_SESSION\s*\[|\b(?:current[_-]?user|owner(?:[_-]?id)?|"
+            r"tenant(?:[_-]?id)?|permission|authorized|role|user[_-]?id)\b",
+            condition,
+            re.I,
+        )
+        comparison = re.search(r"===|==|!==|!=", condition)
+        if tracked_reference and identity_reference and comparison:
+            return ("direct", None)
+
+        call = re.search(r"\b([A-Za-z_]\w*)\s*\(([^()]*)\)", condition)
+        if not call or not variables:
+            return None
+        helper_name, arguments = call.groups()
+        if not re.search(r"\$(?:" + "|".join(variables) + r")\b", arguments):
+            return None
+        for helper_file, helper_source in source_text_by_file.items():
+            helper_lines = helper_source.splitlines()
+            for index, helper_line in enumerate(helper_lines):
+                declaration = re.search(
+                    r"\bfunction\s+" + re.escape(helper_name)
+                    + r"\s*\(([^)]*)\)\s*\{", helper_line, re.I
+                )
+                if not declaration:
+                    continue
+                params = re.findall(r"\$([A-Za-z_]\w*)", declaration.group(1))
+                depth, body = helper_line.count("{") - helper_line.count("}"), []
+                cursor = index + 1
+                while cursor < len(helper_lines) and depth > 0:
+                    body_line = helper_lines[cursor]
+                    body.append(body_line)
+                    depth += body_line.count("{") - body_line.count("}")
+                    cursor += 1
+                if depth != 0 or len(params) != 1:
+                    continue
+                body_text = "\n".join(body)
+                param = re.escape(params[0])
+                if (re.search(r"\$" + param + r"\b", body_text)
+                        and re.search(r"===|==|!==|!=", body_text)
+                        and re.search(
+                            r"\$_SESSION\s*\[|\b(?:owner(?:_id)?|tenant(?:_id)?|user_id)\b",
+                            body_text, re.I)):
+                    return ("helper", (helper_file, index + 1, helper_name))
+        return None
+
     visit(root_file)
+
+    # Separate, bounded $_FILES tracing. Multipart semantics and indirect
+    # helper behavior are not treated as a general taint model.
+    upload_observations, upload_unresolved, upload_checks, upload_helper_calls = [], [], [], []
+    upload_source_pattern = re.compile(
+        r"\$_FILES\s*\[\s*(['\"])([^'\"]+)\1\s*\]\s*\[\s*(['\"])([^'\"]+)\3\s*\]"
+    )
+    upload_array_pattern = re.compile(r"\$_FILES\s*\[\s*(['\"])([^'\"]+)\1\s*\]")
+    for upload_file, upload_text in source_text_by_file.items():
+        lines = upload_text.splitlines()
+        aliases = {}
+        user_controlled_variables = set()
+        seen_upload = []
+        for line_number, line in enumerate(lines, 1):
+            refs = list(upload_source_pattern.finditer(line))
+            seen_upload.extend((line_number, ref.group(2), ref.group(4), line.strip()) for ref in refs)
+            if not refs:
+                seen_upload.extend((line_number, ref.group(2), "whole entry", line.strip()) for ref in upload_array_pattern.finditer(line))
+            assignment = re.match(r"\s*\$(\w+)\s*=\s*(.*?)\s*;", line)
+            if assignment and refs:
+                aliases[assignment.group(1)] = refs[0].group(4)
+            if assignment:
+                assigned_variable, assigned_expression = assignment.groups()
+                if re.search(r"\$_(?:GET|POST|REQUEST)\s*\[", assigned_expression) or any(
+                    variable in user_controlled_variables
+                    for variable in re.findall(r"\$(\w+)", assigned_expression)
+                ):
+                    user_controlled_variables.add(assigned_variable)
+            checks = []
+            if re.search(r"pathinfo\s*\([^\n]*PATHINFO_EXTENSION|\b(?:allowed_extensions|valid_extensions)\b|\bextension\b[^\n]*(?:in_array|preg_match|===|==)", line, re.I):
+                checks.append("filename/extension check")
+            if re.search(r"\b(?:mime_content_type|finfo_file)\s*\(|\$_FILES\s*\[[^\n]*\]\s*\[\s*['\"]type['\"]", line, re.I):
+                checks.append("MIME-type check")
+            if re.search(r"\$_FILES\s*\[[^\n]*\]\s*\[\s*['\"]error['\"]|\bUPLOAD_ERR_[A-Z_]+\b", line, re.I):
+                checks.append("upload error check")
+            if re.search(r"\$_FILES\s*\[[^\n]*\]\s*\[\s*['\"]size['\"]|\b(?:filesize|size)\b[^\n]*(?:<|<=|>|>=)|(?:<|<=|>|>=)[^\n]*\b(?:max_size|upload_max)", line, re.I):
+                checks.append("upload size check")
+            upload_checks.extend((upload_file, line_number, check, line.strip()) for check in checks)
+            if not re.search(r"\bfunction\s+", line, re.I):
+                for helper_call in re.finditer(r"\b([A-Za-z_]\w*(?:validate|check|upload)[A-Za-z_]*)\s*\(", line, re.I):
+                    upload_helper_calls.append((upload_file, line_number, helper_call.group(1), line.strip()))
+            operation = re.search(r"\b(move_uploaded_file|file_put_contents)\s*\((.*)", line, re.I)
+            if operation:
+                args = split_sink_arguments(operation.group(2).rstrip(" );"))
+                source_arg = args[0] if operation.group(1).lower() == "move_uploaded_file" and args else (args[1] if len(args) > 1 else "")
+                source_var = re.fullmatch(r"\$(\w+)", source_arg.strip())
+                source_reaches = ("$_FILES" in source_arg and "tmp_name" in source_arg) or bool(source_var and aliases.get(source_var.group(1)) == "tmp_name")
+                if source_reaches and args:
+                    destination = args[1] if operation.group(1).lower() == "move_uploaded_file" and len(args) > 1 else args[0]
+                    controlled = bool(re.search(r"\$_(?:GET|POST|REQUEST)\s*\[", destination)) or any(
+                        variable in user_controlled_variables
+                        for variable in re.findall(r"\$(\w+)", destination)
+                    )
+                    upload_observations.append((upload_file, line_number, operation.group(1), destination, controlled, line.strip()))
+        if not any(item[0] == upload_file for item in upload_observations):
+            upload_unresolved.extend((upload_file, number, field, key, excerpt) for number, field, key, excerpt in seen_upload)
+
+    def stored_sql_expression(text):
+        """Build a conservative SQL template from literals joined by simple variables."""
+        assignment = re.fullmatch(r"\s*\$([A-Za-z_]\w*)\s*=\s*(.*?)\s*;\s*", text)
+        if not assignment:
+            return None, None, []
+        variable, expression = assignment.groups()
+        token_pattern = re.compile(r"'((?:\\.|[^'\\])*)'|\"((?:\\.|[^\"\\])*)\"|\$([A-Za-z_]\w*)")
+        pieces, variables, position, index = [], [], 0, 0
+        for token in token_pattern.finditer(expression):
+            separator = expression[position:token.start()]
+            if pieces:
+                if not re.fullmatch(r"\s*\.\s*", separator):
+                    return variable, None, variables
+            elif separator.strip():
+                return variable, None, variables
+            if token.group(3):
+                pieces.append(f"__JARVIS_VAR_{index}__")
+                variables.append(token.group(3))
+                index += 1
+            else:
+                pieces.append(token.group(1) if token.group(1) is not None else token.group(2))
+            position = token.end()
+        if not pieces or expression[position:].strip():
+            return variable, None, variables
+        return variable, "".join(pieces), variables
+
+    def stored_sql_parts(template):
+        if not template:
+            return None
+        insert = re.fullmatch(
+            r"\s*INSERT\s+INTO\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*VALUES\s*\((.*?)\)\s*;?\s*",
+            template, re.I | re.S,
+        )
+        if insert:
+            columns = [item.strip().strip("` ") for item in split_top_level_list(insert.group(2))]
+            values = [item.strip() for item in split_top_level_list(insert.group(3))]
+            if not columns or len(columns) != len(values) or any(
+                not re.fullmatch(r"[A-Za-z_]\w*", column) for column in columns
+            ) or len({column.lower() for column in columns}) != len(columns):
+                return {"operation": "INSERT", "supported": False}
+            mapped = {}
+            for column, value in zip(columns, values):
+                markers = re.findall(r"__JARVIS_VAR_(\d+)__", value)
+                mapped[column.lower()] = {
+                    "value": value,
+                    "markers": tuple(int(marker) for marker in markers),
+                }
+            return {"operation": "INSERT", "table": insert.group(1).lower(), "columns": mapped, "supported": True}
+
+        select = re.fullmatch(
+            r"\s*SELECT\s+(.*?)\s+FROM\s+([A-Za-z_]\w*)(?:\s+WHERE\s+(.*?))?\s*;?\s*",
+            template, re.I | re.S,
+        )
+        if select:
+            projection = select.group(1).strip()
+            if "__JARVIS_VAR_" in projection or "__JARVIS_VAR_" in select.group(2):
+                return {"operation": "SELECT", "supported": False}
+            columns = None if projection == "*" else [
+                item.strip().strip("` ").lower()
+                for item in split_top_level_list(projection)
+            ]
+            if columns is not None and any(
+                not re.fullmatch(r"[A-Za-z_]\w*", column) for column in columns
+            ):
+                return {"operation": "SELECT", "supported": False}
+            predicate = select.group(3)
+            where_match = re.fullmatch(
+                r"\s*([A-Za-z_]\w*)\s*=\s*(.*?)\s*", predicate, re.S
+            ) if predicate else None
+            where = (where_match.group(1).lower(), where_match.group(2)) if where_match else None
+            return {
+                "operation": "SELECT", "table": select.group(2).lower(),
+                "columns": columns, "where": where,
+                "where_supported": predicate is None or where_match is not None,
+                "where_text": predicate, "supported": True,
+            }
+
+        operation = re.match(r"\s*(INSERT|SELECT|UPDATE|DELETE)\b", template, re.I)
+        if operation:
+            return {"operation": operation.group(1).upper(), "supported": False}
+        return None
+
+    def resolve_output_helper(helper_name, argument_expression):
+        candidates = [
+            candidate for candidate in function_summaries.get(helper_name.lower(), [])
+            if candidate[1] == root_file or candidate[1] in visited
+        ]
+        if len(candidates) != 1 or candidates[0][0] is None:
+            return None, "helper definition is missing, ambiguous, or unsupported"
+        summary, helper_file, definition_line, _, _ = candidates[0]
+        if summary.get("branch_paths"):
+            return None, "helper has branch-specific returns that are not resolved for this row expression"
+        arguments = split_call_arguments(argument_expression)
+        parameter = summary.get("parameter")
+        if parameter is None or parameter not in summary.get("params", []):
+            return None, "helper return does not identify a supported input parameter"
+        parameter_index = summary["params"].index(parameter)
+        if parameter_index >= len(arguments) or arguments[parameter_index].strip() != argument_expression:
+            return None, "helper argument-to-return mapping is unsupported or ambiguous"
+        if summary.get("return_kind") == "transformed":
+            category = summary.get("return_category", "other-transformation")
+            return {
+                "name": helper_name,
+                "file": helper_file,
+                "definition_line": definition_line,
+                "parameter": parameter,
+                "argument": argument_expression,
+                "return_line": summary["return_line"],
+                "return_expression": summary["return_expression"],
+                "category": category,
+            }, None
+        return {
+            "name": helper_name,
+            "file": helper_file,
+            "definition_line": definition_line,
+            "parameter": parameter,
+            "argument": argument_expression,
+            "return_line": summary["return_line"],
+            "return_expression": f"${summary['return_variable']}",
+            "category": "identity",
+        }, None
+
+    for stored_file, stored_lines in source_lines_by_file.items():
+        if stored_file.resolve() != root_file:
+            continue
+        stored_origins = {}
+        query_candidates = {}
+        executed_operations = []
+        result_sources = {}
+        fetched_rows = {}
+        unresolved_result_sources = {}
+        unresolved_fetch_rows = {}
+        write_events = []
+        read_events = []
+        for number, line in enumerate(stored_lines, 1):
+            text = line.strip()
+            code = mask_php_sink_code(
+                line,
+                {"php": True, "block_comment": False, "quote": None, "escaped": False},
+            )
+            assignment = assignment_pattern.match(text)
+            sql_variable, sql_template, php_variables = stored_sql_expression(text)
+            sql_template_operation = re.match(
+                r"\s*(INSERT|SELECT|UPDATE|DELETE)\b", sql_template or "", re.I
+            )
+            dynamic_sql_operation = (
+                re.match(
+                    r"\s*(['\"])(?:\s*)(INSERT|SELECT|UPDATE|DELETE)\b",
+                    assignment.group(3), re.I,
+                )
+                if assignment else None
+            )
+            if sql_variable and (
+                sql_template_operation is not None or dynamic_sql_operation is not None
+            ):
+                parsed = stored_sql_parts(sql_template) if sql_template is not None else None
+                if parsed:
+                    parsed.update({
+                        "file": stored_file, "line": number,
+                        "text": text, "template": sql_template,
+                        "php_variables": php_variables,
+                        "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                    })
+                    query_candidates.setdefault(sql_variable, []).append(parsed)
+                else:
+                    operation_name = (
+                        sql_template_operation.group(1).upper()
+                        if sql_template_operation
+                        else dynamic_sql_operation.group(2).upper()
+                        if dynamic_sql_operation else "SQL"
+                    )
+                    query_candidates.setdefault(sql_variable, []).append({
+                        "operation": operation_name,
+                        "supported": False,
+                        "file": stored_file,
+                        "line": number,
+                        "text": text,
+                        "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                    })
+                    unresolved_stored_data.append(
+                        f"Unresolved {operation_name} stored-data SQL at {stored_file.name}:{number}: dynamic or unsupported query expression."
+                    )
+                continue
+
+            if assignment:
+                destination, operator, expression = assignment.groups()
+                direct = input_pattern.fullmatch(expression.strip())
+                alias = re.fullmatch(r"\$(\w+)", expression.strip())
+                line_key = (stored_file.resolve(), number)
+                guard_context = guards_by_source_line.get(line_key, [])
+                else_branch = any("else" in arm for _, _, _, arm in guard_context)
+                expression_refs = [] if expression.strip().startswith("isset(") else input_pattern.findall(expression)
+                tracked_refs = [
+                    name for name in variable_pattern.findall(expression)
+                    if name in stored_origins
+                ]
+                relevant_assignment = bool(
+                    direct or destination in stored_origins
+                    or alias and alias.group(1) in stored_origins
+                    or expression_refs or tracked_refs
+                )
+                if not relevant_assignment:
+                    pass
+                elif line_key in unsupported_source_lines:
+                    stored_origins.pop(destination, None)
+                    unresolved_stored_data.append(
+                        f"Assignment at {stored_file.name}:{number} occurs in unsupported control flow; stored-data provenance remains unresolved."
+                    )
+                elif else_branch:
+                    stored_origins.pop(destination, None)
+                    unresolved_stored_data.append(
+                        f"Assignment at {stored_file.name}:{number} is in an else branch whose join is not modeled; stored-data provenance remains unresolved."
+                    )
+                elif operator == "=" and direct:
+                    method, key = direct.groups()
+                    stored_origins[destination] = {
+                        "source": (method.upper(), key, stored_file, number),
+                        "assignments": [(stored_file, number, destination)],
+                        "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                    }
+                elif operator == "=" and alias and alias.group(1) in stored_origins:
+                    stored_origins[destination] = dict(stored_origins[alias.group(1)])
+                    stored_origins[destination]["assignments"] = list(
+                        stored_origins[destination]["assignments"]
+                    ) + [(stored_file, number, destination)]
+                    stored_origins[destination]["guards"] = list(dict.fromkeys(
+                        stored_origins[destination]["guards"]
+                        + guards_by_source_line.get((stored_file.resolve(), number), [])
+                    ))
+                elif operator == "=":
+                    (
+                        helper_direct, _, helper_uncertain, helper_refs,
+                        helper_records, helper_edges, helper_unresolved,
+                        _, helper_unsupported,
+                    ) = evaluate_expression(expression, stored_file, number)
+                    if (
+                        helper_records and not helper_uncertain and not helper_unsupported
+                        and not helper_unresolved and len(set(helper_records)) == 1
+                    ):
+                        method, key, source_file, source_line = helper_records[0]
+                        stored_origins[destination] = {
+                            "source": (method, key, source_file, source_line),
+                            "assignments": [(stored_file, number, destination)],
+                            "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                            "helper_edges": helper_edges,
+                        }
+                        for edge in helper_edges:
+                            if edge and edge[0] == "function-branch":
+                                (
+                                    _, call_file, call_line, helper_name, definition_file,
+                                    definition_line, switch_expression, condition,
+                                    branch_line, return_line, shared_return_line, _parameter,
+                                    _argument_expression, return_kind, return_expression,
+                                    helper_prelude,
+                                ) = edge
+                                if return_kind == "quote-escaping":
+                                    transform_note = transformation_context_note(return_kind, "SQL/query")
+                                elif return_kind == "sql-escaping":
+                                    transform_note = "SQL escaping, not HTML output encoding; effectiveness is not inferred."
+                                elif return_kind == "html-output-encoding":
+                                    transform_note = "HTML output encoding, not SQL escaping; context effectiveness is not inferred."
+                                elif return_kind == "identity":
+                                    transform_note = "identity return."
+                                else:
+                                    transform_note = "transformation category unresolved."
+                                stored_data_observations.append(
+                                    f"Helper call {helper_name} at {call_file.name}:{call_line} resolves branch {condition} of switch ({switch_expression}) in definition at {definition_file.name}:{definition_line}, branch line {branch_line}; branch expression {return_expression} at {definition_file.name}:{return_line} is classified as {transform_note}"
+                                )
+                                if shared_return_line:
+                                    stored_data_observations.append(
+                                        f"Shared helper return at {definition_file.name}:{shared_return_line} returns ${_parameter}; this connects the branch assignment to the helper result."
+                                    )
+                                for prelude_file, prelude_line, prelude_text in helper_prelude:
+                                    stored_data_observations.append(
+                                        f"Helper context include at {prelude_file.name}:{prelude_line}: {prelude_text} (included context is observed; runtime effects are not validated)."
+                                    )
+                                nested_call = re.fullmatch(
+                                    r"([A-Za-z_]\w*)\s*\((.*)\)", return_expression
+                                )
+                                if nested_call:
+                                    nested_candidates = [
+                                        candidate for candidate in function_summaries.get(
+                                            nested_call.group(1).lower(), []
+                                        ) if candidate[1] == root_file or candidate[1] in visited
+                                    ]
+                                    if len(nested_candidates) == 1 and nested_candidates[0][0]:
+                                        nested_summary, nested_file, nested_line, _, _ = nested_candidates[0]
+                                        nested_arguments = split_call_arguments(nested_call.group(2))
+                                        parameter_index = nested_summary["params"].index(nested_summary["parameter"])
+                                        argument_value = nested_arguments[parameter_index] if parameter_index < len(nested_arguments) else "(unresolved argument)"
+                                        if nested_summary.get("return_kind") == "transformed":
+                                            nested_kind = nested_summary.get("return_category", "other-transformation")
+                                            nested_note = transformation_context_note(
+                                                nested_kind, "SQL/query"
+                                            )
+                                            nested_return = nested_summary["return_expression"]
+                                        else:
+                                            nested_note = "identity return"
+                                            nested_return = f"${nested_summary['return_variable']}"
+                                        stored_data_observations.append(
+                                            f"Nested helper {nested_call.group(1)} definition at {nested_file.name}:{nested_line}: parameter ${nested_summary['parameter']} receives {argument_value}; return {nested_return} at {nested_file.name}:{nested_summary['return_line']} ({nested_note}; effectiveness is not inferred)."
+                                        )
+                    else:
+                        if destination in stored_origins:
+                            stored_origins.pop(destination, None)
+                        refs = expression_refs
+                        if refs:
+                            method, key = refs[0]
+                            call_match = re.search(r"([A-Za-z_]\w*)\s*\(", expression)
+                            unresolved_stored_data.append(
+                                f"Request [{method.upper()}] {key} at {stored_file.name}:{number} is passed through "
+                                f"unresolved expression {call_match.group(1) + '()' if call_match else 'an unsupported expression'}; "
+                                "the transformed value is not linked to a database write."
+                            )
+                else:
+                    if destination in stored_origins:
+                        stored_origins.pop(destination, None)
+                    refs = expression_refs
+                    if refs:
+                        method, key = refs[0]
+                        call_match = re.search(r"([A-Za-z_]\w*)\s*\(", expression)
+                        unresolved_stored_data.append(
+                            f"Request [{method.upper()}] {key} at {stored_file.name}:{number} is passed through "
+                            f"unresolved expression {call_match.group(1) + '()' if call_match else 'an unsupported expression'}; "
+                            "the transformed value is not linked to a database write."
+                        )
+
+            execution = re.search(
+                r"\$(\w+)\s*=\s*\$\w+\s*->\s*query\s*\(\s*\$(\w+)\s*\)", code, re.I
+            )
+            if not execution:
+                execution = re.search(
+                    r"\$\w+\s*->\s*query\s*\(\s*\$(\w+)\s*\)", code, re.I
+                )
+                result_variable = None
+                query_variable = execution.group(1) if execution else None
+            else:
+                result_variable, query_variable = execution.groups()
+            if query_variable:
+                candidates = query_candidates.pop(query_variable, [])
+                if len(candidates) != 1 or not candidates[0].get("supported"):
+                    if len(candidates) != 1:
+                        reason = "multiple or missing query assignments make the statement ambiguous"
+                        if len(candidates) > 1 and all(
+                            candidate.get("operation") == "SELECT" for candidate in candidates
+                        ):
+                            reason += " (conflicting SELECT assignments)"
+                    else:
+                        reason = (
+                            f"dynamic or unsupported query expression ({candidates[0].get('operation', 'query')} syntax unsupported)"
+                        )
+                    unresolved_stored_data.append(
+                        f"Unresolved stored-data execution at {stored_file.name}:{number}: {reason}."
+                    )
+                    executed_operations.append((number, None))
+                    if result_variable:
+                        query_lines = ", ".join(
+                            f"{candidate.get('file', stored_file).name}:{candidate.get('line', 'unknown')}"
+                            for candidate in candidates
+                        ) or "unknown"
+                        candidate_details = "; ".join(
+                            f"{candidate.get('file', stored_file).name}:{candidate.get('line', 'unknown')} "
+                            + (
+                                "wildcard projection leaves columns unresolved"
+                                if candidate.get("operation") == "SELECT"
+                                and candidate.get("supported")
+                                and candidate.get("columns") is None
+                                else "dynamic/unsupported query syntax"
+                                if not candidate.get("supported")
+                                else "supported SELECT query"
+                            )
+                            for candidate in candidates
+                        )
+                        unresolved_result_sources[result_variable] = (
+                            f"{reason}; SELECT/query assignment location(s): {query_lines}; {candidate_details}"
+                        )
+                else:
+                    query = candidates[0]
+                    operation = query["operation"]
+                    event = {"query": query, "execution_file": stored_file, "execution_line": number, "guards": guards_by_source_line.get((stored_file.resolve(), number), [])}
+                    executed_operations.append((number, query))
+                    if operation == "INSERT":
+                        for column, value in query.get("columns", {}).items():
+                            marker_ids = value["markers"]
+                            if len(marker_ids) == 1:
+                                marker_index = marker_ids[0]
+                                php_variables = query.get("php_variables", [])
+                                actual_variable = php_variables[marker_index] if marker_index < len(php_variables) else None
+                                origin = stored_origins.get(actual_variable) if actual_variable else None
+                                if origin:
+                                    event["column"] = column
+                                    event["origin"] = origin
+                                    event["value_variable"] = actual_variable
+                                    write_events.append(event)
+                                    source_method, source_key, source_file, source_line = origin["source"]
+                                    stored_data_observations.append(
+                                        f"Request [{source_method}] {source_key} at {source_file.name}:{source_line} is assigned to ${actual_variable} and appears in INSERT column {column} at {query['file'].name}:{query['line']}, executed at {stored_file.name}:{number}."
+                                    )
+                                elif len(marker_ids) != 1 or actual_variable:
+                                    stored_data_observations.append(
+                                        f"INSERT column {column} at {query['file'].name}:{query['line']} contains an unlinked or ambiguous PHP value; request provenance is not established."
+                                    )
+                    elif operation == "SELECT":
+                        event["result_variable"] = result_variable
+                        read_events.append(event)
+                        projection = "*" if query["columns"] is None else ", ".join(query["columns"])
+                        stored_data_observations.append(
+                            f"SELECT construction at {query['file'].name}:{query['line']} observes {projection} from {query['table']}; execution at {stored_file.name}:{number}."
+                        )
+                        if query.get("where_text") and not query.get("where_supported"):
+                            unresolved_stored_data.append(
+                                f"SELECT at {query['file'].name}:{query['line']} has an unsupported WHERE predicate {query['where_text']}; predicate semantics remain unresolved."
+                            )
+                        if result_variable:
+                            result_sources[result_variable] = event
+            fetch = re.search(
+                r"(?:\$(\w+)\s*=\s*)?\$(\w+)\s*->\s*(fetch_object|fetch_assoc)\s*\(\s*\)",
+                code, re.I,
+            )
+            any_fetch = re.search(
+                r"(?:\$(\w+)\s*=\s*)?\$(\w+)\s*->\s*(fetch_[A-Za-z_]\w*)\s*\(",
+                code, re.I,
+            )
+            if fetch:
+                row_variable, result_variable, fetch_method = fetch.groups()
+                read_event = result_sources.get(result_variable)
+                if row_variable and read_event:
+                    fetch_record = {
+                        "file": stored_file, "line": number, "text": text,
+                        "row_variable": row_variable, "method": fetch_method.lower(),
+                        "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                    }
+                    fetched_rows[row_variable] = {"read": read_event, "fetch": fetch_record}
+                    read_event.setdefault("fetches", []).append(fetch_record)
+                    stored_data_observations.append(
+                        f"Fetch observation at {stored_file.name}:{number}: {fetch_method.lower()} assigns ${row_variable} from SELECT result ${result_variable}."
+                    )
+                elif row_variable and result_variable in unresolved_result_sources:
+                    unresolved_fetch_rows[row_variable] = {
+                        "result_variable": result_variable,
+                        "file": stored_file, "line": number, "text": text,
+                        "reason": unresolved_result_sources[result_variable],
+                    }
+            elif any_fetch:
+                row_variable, result_variable, fetch_method = any_fetch.groups()
+                if result_variable in result_sources or result_variable in unresolved_result_sources:
+                    reason = (
+                        f"unsupported fetch method {fetch_method}"
+                        if fetch_method.lower() not in {"fetch_object", "fetch_assoc"}
+                        else "supported fetch call has unsupported arguments or no row destination"
+                    )
+                    unresolved_stored_data.append(
+                        f"Unresolved fetch at {stored_file.name}:{number} for ${result_variable}: {reason}; fetched-column provenance remains unresolved."
+                    )
+                    if row_variable:
+                        unresolved_fetch_rows[row_variable] = {
+                            "result_variable": result_variable,
+                            "file": stored_file, "line": number, "text": text,
+                            "reason": reason,
+                        }
+
+            output = re.search(
+                r"\b(echo|print)\b.*?\$(\w+)\s*(?:->\s*(\w+)|\[\s*(['\"])([^'\"]+)\4\s*\])",
+                text, re.I,
+            )
+            if output:
+                row_variable = output.group(2)
+                if row_variable.startswith("_"):
+                    output = None
+            if output:
+                row_variable = output.group(2)
+                object_column = output.group(3)
+                array_column = output.group(5)
+                column = object_column or array_column
+                access_kind = "object" if object_column else "array"
+                access_start = line.find(text) + output.start(2) - 1
+                executable_access = code[access_start:access_start + len(row_variable) + 1] == "$" + row_variable
+                if not executable_access:
+                    output = None
+                else:
+                    helper_match = re.search(
+                        r"\b([A-Za-z_]\w*)\s*\(\s*\$" + re.escape(row_variable)
+                        + (r"\s*->\s*" + re.escape(column) if access_kind == "object" else r"\s*\[\s*['\"]" + re.escape(column) + r"['\"]\s*\]")
+                        + r"\s*\)", text,
+                    )
+                    helper_evidence = None
+                    helper_failure = None
+                    if helper_match:
+                        argument_expression = helper_match.group(0)[
+                            helper_match.group(0).find("$"): -1
+                        ]
+                        helper_evidence, helper_failure = resolve_output_helper(
+                            helper_match.group(1), argument_expression
+                        )
+                    row_binding = fetched_rows.get(row_variable)
+                    if row_binding:
+                        read_event = row_binding["read"]
+                        output_record = {
+                            "file": stored_file, "line": number, "column": column,
+                            "text": text,
+                            "guards": guards_by_source_line.get((stored_file.resolve(), number), []),
+                            "row_variable": row_variable, "access_kind": access_kind,
+                            "fetch": row_binding["fetch"],
+                            "helper": helper_evidence,
+                            "helper_failure": helper_failure,
+                        }
+                        read_event.setdefault("outputs", []).append(output_record)
+                        stored_data_observations.append(
+                            f"Output expression observation at {stored_file.name}:{number} references retrieved row column {column} through ${row_variable}: {text}."
+                        )
+                    elif row_variable in unresolved_fetch_rows:
+                        unresolved_fetch = unresolved_fetch_rows[row_variable]
+                        unresolved_access = (
+                            f"${row_variable}->{column}"
+                            if access_kind == "object"
+                            else f"${row_variable}['{column}']"
+                        )
+                        unresolved_stored_data.append(
+                            f"Unresolved SELECT-to-output relationship at {stored_file.name}:{number}: output uses {unresolved_access}; fetch at {unresolved_fetch['file'].name}:{unresolved_fetch['line']} from ${unresolved_fetch['result_variable']} is unresolved ({unresolved_fetch['reason']})."
+                        )
+                    else:
+                        stored_data_observations.append(
+                            f"Output expression observation at {stored_file.name}:{number} references ${row_variable} column {column}: {text}; no supported fetch-to-SELECT relationship is established."
+                        )
+
+        for read in read_events:
+            query = read["query"]
+            for output in read.get("outputs", []):
+                output_column = output["column"].lower()
+                selected_columns = query.get("columns")
+                if selected_columns is None:
+                    unresolved_stored_data.append(
+                        f"Unresolved SELECT-to-output relationship: SELECT at {query['file'].name}:{query['line']} uses wildcard projection; source does not identify whether column {output_column} is present in the result."
+                    )
+                    continue
+                if output_column not in selected_columns:
+                    unresolved_stored_data.append(
+                        f"Unresolved SELECT-to-output relationship: SELECT at {query['file'].name}:{query['line']} projects {', '.join(selected_columns)}, but output at {output['file'].name}:{output['line']} accesses column {output_column}."
+                    )
+                    continue
+                expected_access = "object" if output["fetch"]["method"] == "fetch_object" else "array"
+                if output["access_kind"] != expected_access:
+                    unresolved_stored_data.append(
+                        f"Unresolved SELECT-to-output relationship: {output['fetch']['method']} at {output['fetch']['file'].name}:{output['fetch']['line']} does not establish {output['access_kind']} access ${output['row_variable']} for column {output_column}."
+                    )
+                    continue
+                if output["helper_failure"]:
+                    unresolved_stored_data.append(
+                        f"Unresolved SELECT-to-output relationship at {output['file'].name}:{output['line']}: retrieved column {output_column} is passed to helper {output['helper_failure']}; helper argument-to-return provenance is unresolved."
+                    )
+                    continue
+                if any(
+                    operation is None
+                    or operation.get("table") == query["table"]
+                    and operation.get("operation") in {"DELETE", "UPDATE", "INSERT"}
+                    for execution_line, operation in executed_operations
+                    if read["execution_line"] < execution_line < output["line"]
+                ):
+                    unresolved_stored_data.append(
+                        f"Unresolved SELECT-to-output relationship: an intervening or ambiguous database mutation follows SELECT at {query['file'].name}:{query['line']} before output at {output['file'].name}:{output['line']}."
+                    )
+                    continue
+                select_output_flows.append({
+                    "read": read,
+                    "output": output,
+                    "guards": list(dict.fromkeys(
+                        query.get("guards", [])
+                        + read["guards"]
+                        + output["fetch"]["guards"]
+                        + output["guards"]
+                    )),
+                })
+
+        supported_select_output_pairs = {
+            (id(flow["read"]), id(flow["output"])) for flow in select_output_flows
+        }
+        for write in write_events:
+            query = write["query"]
+            key_column = None
+            for column, value in query.get("columns", {}).items():
+                if column == "id" or column.endswith("_id"):
+                    if len(value["markers"]) == 0:
+                        key_column = (column, value["value"])
+                        break
+            if key_column is None:
+                unresolved_stored_data.append(
+                    f"INSERT at {query['file'].name}:{query['line']} has no supported literal key value to match a later row read; table/column similarity alone is insufficient."
+                )
+                continue
+            for read in read_events:
+                read_query = read["query"]
+                if read_query["table"] != query["table"]:
+                    unresolved_stored_data.append(
+                        f"SELECT at {read_query['file'].name}:{read_query['line']} reads table {read_query['table']}, not INSERT table {query['table']}; no stored-record relationship is inferred."
+                    )
+                    continue
+                projection = read_query["columns"]
+                if projection is not None and write["column"] not in projection:
+                    continue
+                predicate = read_query.get("where")
+                if predicate != key_column:
+                    unresolved_stored_data.append(
+                        f"SELECT at {read_query['file'].name}:{read_query['line']} does not prove a row match to INSERT at {query['file'].name}:{query['line']}; matching table or column alone is insufficient."
+                    )
+                    continue
+                if any(
+                    operation is None
+                    or operation.get("table") == query["table"]
+                    and operation.get("operation") in {"DELETE", "UPDATE", "INSERT"}
+                    for execution_line, operation in executed_operations
+                    if write["execution_line"] < execution_line < read["execution_line"]
+                ):
+                    unresolved_stored_data.append(
+                        f"An intervening or ambiguous database operation prevents linking INSERT at {query['file'].name}:{query['line']} to SELECT at {read_query['file'].name}:{read_query['line']}."
+                    )
+                    continue
+                for output in read.get("outputs", []):
+                    if (id(read), id(output)) not in supported_select_output_pairs:
+                        continue
+                    output_file = output["file"]
+                    output_line = output["line"]
+                    output_column = output["column"]
+                    output_text = output["text"]
+                    output_guards = output["guards"]
+                    if output_column.lower() != write["column"]:
+                        continue
+                    if any(
+                        operation is None
+                        or operation.get("table") == query["table"]
+                        and operation.get("operation") in {"DELETE", "UPDATE", "INSERT"}
+                        for execution_line, operation in executed_operations
+                        if read["execution_line"] < execution_line < output_line
+                    ):
+                        unresolved_stored_data.append(
+                            f"An intervening or ambiguous database operation prevents linking SELECT at {read_query['file'].name}:{read_query['line']} to output at {output_file.name}:{output_line}."
+                        )
+                        continue
+                    stored_data_flows.append({
+                        "write": write, "read": read,
+                        "output": (output_file, output_line, output_column, output_text, output_guards),
+                        "output_helper": output["helper"],
+                        "guards": list(dict.fromkeys(
+                            write["origin"]["guards"]
+                            + query.get("guards", [])
+                            + write["guards"]
+                            + read_query.get("guards", [])
+                            + read["guards"]
+                            + output_guards
+                        )),
+                        "output_file": output_file,
+                    })
+        if not write_events and not read_events:
+            continue
 
     def source_is_entry(record):
         return record[2].resolve() == root_file
 
     report = [
         f"JARVIS: PHP source-flow analysis — {path.name}", "=" * 50, "",
-        "Input evidence:",
+        "Form control observations:",
     ]
+    if form_controls:
+        for control, name, file, number in dict.fromkeys(form_controls):
+            report.append(
+                f"  [{control}] name={name} at {report_path(file)}:{number} (form control only; not evidence that PHP reads or uses this value)."
+            )
+    else:
+        report.append("  No literal named form controls detected.")
+    report.extend([
+        "  Request sources below require a PHP request-variable reference; control names alone are not sources.",
+        "",
+        "Input evidence:",
+    ])
     unique_inputs = list(dict.fromkeys(inputs))
     entry_inputs = [record for record in unique_inputs if source_is_entry(record)]
     included_inputs = [record for record in unique_inputs if not source_is_entry(record)]
@@ -2959,10 +5272,13 @@ def _trace_php_flow(path, source, reports_dir):
     ]
     report.extend(["", "Request presence evidence:"])
     if entry_presence_inputs:
+        report.append(
+            "  Presence checks are selection/control evidence only; they do not establish that the submitted parameter value was read or used."
+        )
         for method, key, file, number, text in entry_presence_inputs:
             report.extend([
-                f"  Presence check: [{method}] {key}",
-                f"    {report_path(file)}:{number}: {text} (parameter presence checked; submitted value not assigned).",
+                f"  Presence check: [{method}] {key} (selection/control presence only)",
+                f"    {report_path(file)}:{number}: {text} (presence checked; submitted value not assigned).",
             ])
     else:
         report.append("  None detected.")
@@ -3018,32 +5334,315 @@ def _trace_php_flow(path, source, reports_dir):
     else:
         report.append("  No sink observations detected.")
     report.extend([
+        "", "File-upload review observations (not vulnerability findings):",
+        "  Supported patterns: direct $_FILES field references, simple same-file aliases of tmp_name, and move_uploaded_file() or file_put_contents() calls on the captured line.",
+        "  Filename, MIME, upload-error, size, and helper-call patterns are recorded as observations only; none is treated as sufficient validation or proof of safety.",
+    ])
+    if upload_observations:
+        for upload_file, upload_line, operation, destination, controlled, excerpt in upload_observations:
+            source_location = next((
+                (source_line, match.group(2), match.group(4))
+                for source_line, source_text in enumerate(source_text_by_file[upload_file].splitlines(), 1)
+                for match in upload_source_pattern.finditer(source_text)
+                if match.group(4) == "tmp_name"
+            ), None)
+            report.extend([
+                f"  Upload source: $_FILES[{source_location[1]!r}][{source_location[2]!r}] at {report_path(upload_file)}:{source_location[0] if source_location else 'unknown'}.",
+                f"  Storage sink: {operation}() at {report_path(upload_file)}:{upload_line}: {excerpt}",
+                f"    Destination expression: {destination} ({'user-controlled expression observed; containment and safe naming are unresolved' if controlled else 'fixed or otherwise unclassified expression; runtime destination is not established'}).",
+            ])
+        if upload_checks:
+            for check_file, check_line, check, excerpt in dict.fromkeys(upload_checks):
+                report.append(f"  Observed {check} at {report_path(check_file)}:{check_line}: {excerpt} (effectiveness and enforcement on this path are unresolved).")
+        else:
+            report.append("  No supported extension, MIME-type, upload-error, or size check pattern was recognized.")
+        for helper_file, helper_line, helper_name, helper_excerpt in dict.fromkeys(upload_helper_calls):
+            report.append(f"  Validation-like helper call {helper_name}(...) at {report_path(helper_file)}:{helper_line}: {helper_excerpt} (helper behavior and enforcement are not inferred).")
+        report.extend([
+            "  Unresolved assumptions: uploaded content is not inspected or executed; destination containment, overwrite behavior, web-server execution policy, storage permissions, helper completeness, and runtime success are not established.",
+            "  Severity: NEEDS_REVIEW; confidence: Low.",
+            "  Vulnerability status: UNCONFIRMED.",
+        ])
+    elif upload_unresolved:
+        for upload_file, number, field, key, excerpt in dict.fromkeys(upload_unresolved):
+            report.append(f"  Unresolved upload handling: $_FILES[{field!r}][{key!r}] at {report_path(upload_file)}:{number}: {excerpt} (no supported storage flow was established).")
+        report.extend([
+            "  Severity: NEEDS_REVIEW; confidence: Low.",
+            "  Vulnerability status: UNCONFIRMED.",
+        ])
+    else:
+        report.append("  No $_FILES upload handling detected.")
+    report.extend([
         "", "Source-flow evidence:",
         "  Supported source-to-sink evidence is static tracing evidence, not vulnerability confirmation.",
     ])
+    object_access_observations = []
+    ssrf_review_observations = []
+    command_injection_observations = []
+    file_access_observations = []
     confirmed = False
     unconditional_confirmed = False
+    helper_branch_flow_confirmed = False
     for file, number, text, sink_type, direct, tracked, invalidated_refs, conditional_flow, flow_snapshot, invalidated_snapshot in sinks:
         report.append(f"  Sink text ({sink_type}) at {report_path(file)}:{number}: {text}")
+        if sink_type == "output":
+            output_variables = [
+                name for name, _, _ in flow_snapshot
+                if name not in {"$guard", "$function_result"}
+            ]
+            output_context, output_context_basis = php_output_context_evidence(
+                text, output_variables
+            )
+            report.append(
+                f"    Output context evidence: {output_context}; {output_context_basis}."
+            )
+            report.append(
+                "    Context is inferred from static source fragments only; this does not prove browser interpretation, runtime reachability, exploitability, or encoder effectiveness."
+            )
         records = [(m, k, file, number) for m, k in direct]
         associated_variables = {}
+        branch_conditioned_records = set()
         for variable, variable_records, _ in flow_snapshot:
             records.extend(variable_records)
-            for record in variable_records:
-                associated_variables.setdefault(record, set()).add(variable)
+            if variable != "$function_result":
+                for record in variable_records:
+                    associated_variables.setdefault(record, set()).add(variable)
+        for _variable, variable_records, variable_edges in flow_snapshot:
+            if any(edge and edge[0] == "function-branch" for edge in variable_edges):
+                branch_conditioned_records.update(variable_records)
         for method, key, source_file, source_line in dict.fromkeys(records):
-            relationship = "Conditional textual relationship" if conditional_flow else "Explicit textual relationship"
+            record = (method, key, source_file, source_line)
+            is_conditional = conditional_flow or record in branch_conditioned_records
+            relationship = "Conditional textual relationship" if is_conditional else "Explicit textual relationship"
             report.append(f"    {relationship}: [{method}] {key} at {report_path(source_file)}:{source_line} reaches a referenced variable or appears directly in the sink at {report_path(file)}:{number}.")
             variables = associated_variables.get((method, key, source_file, source_line))
             if variables:
                 variable_names = ", ".join(f"${variable}" for variable in sorted(variables))
                 report.append(f"      Tracked-variable association: {variable_names}.")
             confirmed = True
-            if not conditional_flow:
+            if not is_conditional:
                 unconditional_confirmed = True
+            if sink_type == "SQL/query" and is_resource_identifier(key):
+                tracked_variables = sorted(
+                    set(associated_variables.get(record, set()))
+                    | {name for name, _, _ in flow_snapshot if name != "$guard"}
+                    | {key}
+                )
+                observed_guards = []
+                for flow_variable, flow_records, flow_edges in flow_snapshot:
+                    if record not in flow_records and flow_variable != "$guard":
+                        continue
+                    for edge in flow_edges:
+                        if edge and edge[0] == "guard":
+                            _, guard_file, guard_line, condition, arm = edge
+                            observed_guards.append((guard_file, guard_line, condition, arm))
+                object_access_observations.append({
+                    "method": method,
+                    "key": key,
+                    "source_file": source_file,
+                    "source_line": source_line,
+                    "sink_file": file,
+                    "sink_line": number,
+                    "sink_type": sink_type,
+                    "tracked_variables": tracked_variables,
+                    "guards": list(dict.fromkeys(observed_guards)),
+                })
+            if sink_type == "Dangerous server-side operation: file_get_contents":
+                tracked_url_variables = sorted(
+                    set(associated_variables.get(record, set()))
+                    | {
+                        name for name, flow_records, _ in flow_snapshot
+                        if record in flow_records and name not in {"$guard", "$function_result"}
+                    }
+                )
+                observed_guards = []
+                for flow_variable, flow_records, flow_edges in flow_snapshot:
+                    if record not in flow_records and flow_variable != "$guard":
+                        continue
+                    for edge in flow_edges:
+                        if edge and edge[0] == "guard":
+                            _, guard_file, guard_line, condition, arm = edge
+                            observed_guards.append((guard_file, guard_line, condition, arm))
+                recognized_checks = []
+                for guard_file, guard_line, condition, arm in dict.fromkeys(observed_guards):
+                    for variable in tracked_url_variables:
+                        variable_name = re.escape(variable.lstrip("$"))
+                        if re.search(
+                            r"\bfilter_var\s*\(\s*\$" + variable_name
+                            + r"\s*,\s*FILTER_VALIDATE_URL\b",
+                            condition,
+                            re.I,
+                        ):
+                            recognized_checks.append((
+                                guard_file, guard_line, condition, arm,
+                                "URL-format validation",
+                            ))
+                        elif re.search(
+                            r"\bin_array\s*\(\s*\$" + variable_name
+                            + r"\s*,\s*\$[A-Za-z_]\w*",
+                            condition,
+                            re.I,
+                        ):
+                            recognized_checks.append((
+                                guard_file, guard_line, condition, arm,
+                                "exact-URL allowlist-like membership",
+                            ))
+                ssrf_review_observations.append({
+                    "method": method,
+                    "key": key,
+                    "source_file": source_file,
+                    "source_line": source_line,
+                    "sink_file": file,
+                    "sink_line": number,
+                    "variables": tracked_url_variables,
+                    "guards": list(dict.fromkeys(observed_guards)),
+                    "checks": list(dict.fromkeys(recognized_checks)),
+                })
+            command_name = sink_type.rsplit(": ", 1)[-1].lower()
+            if (
+                sink_type.startswith("Dangerous server-side operation: ")
+                and command_name in command_execution_names
+            ):
+                tracked_command_variables = sorted(
+                    set(associated_variables.get(record, set()))
+                    | {
+                        name for name, flow_records, _ in flow_snapshot
+                        if record in flow_records and name not in {"$guard", "$function_result"}
+                    }
+                )
+                transformations = []
+                for _flow_variable, flow_records, flow_edges in flow_snapshot:
+                    if record not in flow_records:
+                        continue
+                    for edge in flow_edges:
+                        if edge and edge[0] == "builtin-transformed":
+                            (_, transform_file, transform_line, transform_name,
+                             argument_expression, return_expression, category) = edge
+                            if category in {
+                                "shell-argument-escaping", "shell-command-escaping",
+                            }:
+                                transformations.append({
+                                    "file": transform_file,
+                                    "line": transform_line,
+                                    "name": transform_name,
+                                    "expression": return_expression,
+                                    "category": category,
+                                    "basis": "call",
+                                })
+                        elif edge and edge[0] == "function-transformed":
+                            (_, call_file, call_line, function_name, definition_file,
+                             _definition_line, _parameter, _argument, return_line,
+                             return_expression, category) = edge
+                            if category in {
+                                "shell-argument-escaping", "shell-command-escaping",
+                            }:
+                                transformations.append({
+                                    "file": definition_file,
+                                    "line": return_line,
+                                    "name": function_name,
+                                    "expression": return_expression,
+                                    "category": category,
+                                    "basis": f"helper call at {report_path(call_file)}:{call_line}",
+                                })
+                command_injection_observations.append({
+                    "method": method,
+                    "key": key,
+                    "source_file": source_file,
+                    "source_line": source_line,
+                    "sink_file": file,
+                    "sink_line": number,
+                    "sink_type": sink_type,
+                    "variables": tracked_command_variables,
+                    "transformations": list({
+                        (item["file"].resolve(), item["line"], item["expression"]): item
+                        for item in transformations
+                    }.values()),
+                })
+            file_operation = sink_type.rsplit(": ", 1)[-1].lower()
+            if (
+                sink_type.startswith("Dangerous server-side operation: ")
+                and file_operation in file_read_operation_names
+            ):
+                tracked_path_variables = sorted(
+                    set(associated_variables.get(record, set()))
+                    | {
+                        name for name, flow_records, _ in flow_snapshot
+                        if record in flow_records and name not in {"$guard", "$function_result"}
+                    }
+                )
+                observed_guards = []
+                transformations = []
+                for flow_variable, flow_records, flow_edges in flow_snapshot:
+                    if record not in flow_records and flow_variable != "$guard":
+                        continue
+                    for edge in flow_edges:
+                        if edge and edge[0] == "guard":
+                            _, guard_file, guard_line, condition, arm = edge
+                            observed_guards.append((guard_file, guard_line, condition, arm))
+                        elif edge and edge[0] == "builtin-transformed":
+                            (_, transform_file, transform_line, transform_name,
+                             _argument_expression, return_expression, category) = edge
+                            if category in {"path-component-reduction", "path-canonicalization"}:
+                                transformations.append((
+                                    transform_file, transform_line, transform_name,
+                                    return_expression, category, "direct call",
+                                ))
+                        elif edge and edge[0] == "function-transformed":
+                            (_, call_file, call_line, function_name, definition_file,
+                             _definition_line, _parameter, _argument, return_line,
+                             return_expression, category) = edge
+                            if category in {"path-component-reduction", "path-canonicalization"}:
+                                transformations.append((
+                                    definition_file, return_line, function_name,
+                                    return_expression, category,
+                                    f"helper call at {report_path(call_file)}:{call_line}",
+                                ))
+                base_checks = []
+                for guard_file, guard_line, condition, arm in dict.fromkeys(observed_guards):
+                    for variable in tracked_path_variables:
+                        variable_name = re.escape(variable.lstrip("$"))
+                        if re.search(
+                            r"\b(?:strpos|str_starts_with)\s*\(\s*\$"
+                            + variable_name
+                            + r"\s*,\s*\$[A-Za-z_]\w*(?:base|root|dir|directory)\w*",
+                            condition,
+                            re.I,
+                        ):
+                            base_checks.append((
+                                guard_file, guard_line, condition, arm,
+                                "base-directory prefix check-like condition",
+                            ))
+                file_access_observations.append({
+                    "method": method,
+                    "key": key,
+                    "source_file": source_file,
+                    "source_line": source_line,
+                    "sink_file": file,
+                    "sink_line": number,
+                    "operation": file_operation,
+                    "variables": tracked_path_variables,
+                    "guards": list(dict.fromkeys(observed_guards)),
+                    "base_checks": list(dict.fromkeys(base_checks)),
+                    "transformations": list(dict.fromkeys(transformations)),
+                })
+        reported_guard_edges = set()
         for variable, _, variable_edges in flow_snapshot:
             for edge in variable_edges:
-                if edge and edge[0] == "function-assignment":
+                if edge and edge[0] == "guard":
+                    _, guard_file, guard_line, condition, arm = edge
+                    guard_key = (guard_file.resolve(), guard_line, condition, arm)
+                    if guard_key in reported_guard_edges:
+                        continue
+                    reported_guard_edges.add(guard_key)
+                    report.append(
+                        f"    Guard condition: if ({condition}) at {report_path(guard_file)}:{guard_line}; {arm} path evidence. The condition is not treated as validation or sanitization."
+                    )
+                elif edge and edge[0] == "source-assignment":
+                    _, assignment_file, assignment_line, destination, method, key = edge
+                    report.append(
+                        f"    Assignment evidence: {report_path(assignment_file)}:{assignment_line} ${destination} receives [{method}] {key}."
+                    )
+                elif edge and edge[0] == "function-assignment":
                     _, assignment_file, assignment_line, destination = edge
                     report.append(
                         f"    Assignment evidence: {report_path(assignment_file)}:{assignment_line} ${destination} receives a supported function return."
@@ -3070,6 +5669,137 @@ def _trace_php_flow(path, source, reports_dir):
                     report.append(
                         f"    Function call: {report_path(call_file)}:{call_line} calls {function_name}(...)."
                     )
+                elif edge and edge[0] == "function-transformed":
+                    (
+                        _, call_file, call_line, function_name, definition_file,
+                        definition_line, parameter, argument_expression, return_line,
+                        return_expression, return_category,
+                    ) = edge
+                    report.append(
+                        f"    Function definition: {report_path(definition_file)}:{definition_line} function {function_name}(...)."
+                    )
+                    report.append(
+                        f"    Function parameter: ${parameter} receives {argument_expression} at the call site."
+                    )
+                    if return_category == "quote-escaping":
+                        category_note = transformation_context_note(return_category, sink_type)
+                    elif return_category in {
+                        "shell-argument-escaping", "shell-command-escaping",
+                        "path-component-reduction", "path-canonicalization",
+                    }:
+                        category_note = transformation_context_note(return_category, sink_type)
+                    elif return_category == "sql-escaping":
+                        category_note = "classified as SQL escaping, not HTML output encoding; SQL-context effectiveness is not inferred. Transformation effectiveness is not inferred."
+                    elif return_category == "html-output-encoding":
+                        category_note = "classified as HTML output encoding, not SQL escaping; context effectiveness is not inferred. Transformation effectiveness is not inferred."
+                    else:
+                        category_note = "transformation category is not established; effectiveness is not inferred."
+                    report.append(
+                        f"    Function transformed return expression: {return_expression} at {report_path(definition_file)}:{return_line}; {category_note}"
+                    )
+                    report.append(
+                        f"    Function call: {report_path(call_file)}:{call_line} calls {function_name}(...)."
+                    )
+                elif edge and edge[0] == "builtin-transformed":
+                    (
+                        _, transform_file, transform_line, transform_name,
+                        argument_expression, return_expression, return_category,
+                    ) = edge
+                    transformation_label = (
+                        "Recognized command argument transformation"
+                        if return_category in {"shell-argument-escaping", "shell-command-escaping"}
+                        else "Recognized transformation"
+                    )
+                    report.append(
+                        f"    {transformation_label}: {return_expression} at "
+                        f"{report_path(transform_file)}:{transform_line}; "
+                        f"{transformation_context_note(return_category, sink_type)}"
+                    )
+                elif edge and edge[0] == "function-branch":
+                    (
+                        _, call_file, call_line, function_name, definition_file,
+                        definition_line, switch_expression, condition, branch_line,
+                        return_line, shared_return_line, parameter, argument_expression, return_kind,
+                        return_expression, helper_prelude,
+                    ) = edge
+                    helper_branch_flow_confirmed = True
+                    report.append(
+                        f"    Function definition: {report_path(definition_file)}:{definition_line} function {function_name}(...)."
+                    )
+                    report.append(
+                        f"    Function parameter: ${parameter} receives {argument_expression} at the call site."
+                    )
+                    report.append(
+                        f"    Helper branch condition: switch ({switch_expression}), case {condition} at {report_path(definition_file)}:{branch_line}."
+                    )
+                    for prelude_file, prelude_line, prelude_text in helper_prelude:
+                        report.append(
+                            f"    Helper context include: {report_path(prelude_file)}:{prelude_line} {prelude_text}; source context only."
+                        )
+                    if return_kind == "identity":
+                        identity_suffix = " (assigned before the shared return)" if shared_return_line else ""
+                        report.append(
+                            f"    Helper branch return: {return_expression} unchanged{identity_suffix} at {report_path(definition_file)}:{return_line}."
+                        )
+                    elif return_kind == "sql-escaping":
+                        report.append(
+                            f"    Helper branch return expression: {return_expression} at {report_path(definition_file)}:{return_line}; SQL escaping, not HTML output encoding; SQL-context effectiveness is not inferred. Transformation effectiveness is not inferred."
+                        )
+                    elif return_kind == "quote-escaping":
+                        report.append(
+                            f"    Helper branch return expression: {return_expression} at {report_path(definition_file)}:{return_line}; {transformation_context_note(return_kind, sink_type)}"
+                        )
+                    elif return_kind in {"path-component-reduction", "path-canonicalization"}:
+                        report.append(
+                            f"    Helper branch return expression: {return_expression} at {report_path(definition_file)}:{return_line}; {transformation_context_note(return_kind, sink_type)}"
+                        )
+                    elif return_kind == "html-output-encoding":
+                        report.append(
+                            f"    Helper branch return expression: {return_expression} at {report_path(definition_file)}:{return_line}; HTML output encoding, not SQL escaping; context effectiveness is not inferred. Transformation effectiveness is not inferred."
+                        )
+                    else:
+                        report.append(
+                            f"    Helper branch return expression: {return_expression} at {report_path(definition_file)}:{return_line}; transformation category/effectiveness is not established."
+                        )
+                    if shared_return_line:
+                        report.append(
+                            f"    Shared helper return: {report_path(definition_file)}:{shared_return_line} returns ${parameter}; this follows the branch assignment."
+                        )
+                    nested_call = re.fullmatch(
+                        r"([A-Za-z_]\w*)\s*\((.*)\)", return_expression
+                    )
+                    if nested_call:
+                        nested_candidates = [
+                            candidate for candidate in function_summaries.get(
+                                nested_call.group(1).lower(), []
+                            ) if candidate[1] == root_file or candidate[1] in visited
+                        ]
+                        if len(nested_candidates) == 1 and nested_candidates[0][0]:
+                            nested_summary, nested_file, nested_line, _, _ = nested_candidates[0]
+                            nested_arguments = split_call_arguments(nested_call.group(2))
+                            parameter_index = nested_summary["params"].index(nested_summary["parameter"])
+                            argument_value = nested_arguments[parameter_index] if parameter_index < len(nested_arguments) else "(unresolved argument)"
+                            if nested_summary.get("return_kind") == "transformed":
+                                nested_kind = nested_summary.get("return_category", "other-transformation")
+                                nested_note = (
+                                    transformation_context_note(nested_kind, "SQL/query")
+                                    if nested_kind == "quote-escaping"
+                                    else "SQL escaping, not HTML output encoding"
+                                    if nested_kind == "sql-escaping"
+                                    else "HTML output encoding, not SQL escaping"
+                                    if nested_kind == "html-output-encoding"
+                                    else "transformation category unresolved"
+                                )
+                                nested_return = nested_summary["return_expression"]
+                            else:
+                                nested_note = "identity return"
+                                nested_return = f"${nested_summary['return_variable']}"
+                            report.append(
+                                f"    Nested helper definition: {report_path(nested_file)}:{nested_line} {nested_call.group(1)}(...); parameter ${nested_summary['parameter']} receives {argument_value}; return {nested_return} at {report_path(nested_file)}:{nested_summary['return_line']} ({nested_note}; effectiveness is not inferred)."
+                            )
+                    report.append(
+                        f"    Function call: {report_path(call_file)}:{call_line} calls {function_name}(...)."
+                    )
                 else:
                     edge_file, edge_line, source, dest = edge
                     report.append(f"    Assignment evidence: {report_path(edge_file)}:{edge_line} ${dest} references ${source}.")
@@ -3078,9 +5808,473 @@ def _trace_php_flow(path, source, reports_dir):
             report.append(
                 f"    Unresolved relationship: ${variable} appears at this sink, but its earlier request provenance was invalidated by reassignment at {report_path(invalid_file)}:{invalid_line}; no source-to-sink link is asserted."
             )
+    for flow in prepared_statement_flows:
+        statement = flow["statement"]
+        binding = flow["binding"]
+        query = statement["query"]
+        execute_line = flow["execute_line"]
+        is_conditional = bool(flow["guards"] or any(
+            edge and edge[0] == "guard" for edge in binding["edges"]
+        ))
+        report.append(
+            f"  Sink text (SQL/prepared statement parameter) at {report_path(statement['file'])}:{execute_line}: ${statement['statement_variable']}->execute()."
+        )
+        for method, key, source_file, source_line in binding["records"]:
+            relationship = "Conditional textual relationship" if is_conditional else "Explicit textual relationship"
+            report.append(
+                f"    {relationship}: [{method}] {key} at {report_path(source_file)}:{source_line} reaches bound parameter #{binding['position']} (${binding['variable']}) at {report_path(statement['file'])}:{binding['line']} and execution at {report_path(statement['file'])}:{execute_line}."
+            )
+            confirmed = True
+            if not is_conditional:
+                unconditional_confirmed = True
+            if is_resource_identifier(key):
+                observed_guards = list(flow["guards"])
+                for edge in binding["edges"]:
+                    if edge and edge[0] == "guard":
+                        _, guard_file, guard_line, condition, arm = edge
+                        observed_guards.append((guard_file, guard_line, condition, arm))
+                object_access_observations.append({
+                    "method": method,
+                    "key": key,
+                    "source_file": source_file,
+                    "source_line": source_line,
+                    "sink_file": statement["file"],
+                    "sink_line": execute_line,
+                    "sink_type": "SQL/prepared statement parameter",
+                    "tracked_variables": [f"${binding['variable']}"],
+                    "guards": list(dict.fromkeys(observed_guards)),
+                })
+        report.append(
+            f"    Prepared query: {report_path(statement['file'])}:{query['query_line']} contains {query['placeholder_count']} positional placeholder(s)."
+        )
+        report.append(
+            f"    Prepare call: {report_path(statement['file'])}:{statement['prepare_line']} {statement['prepare_text']}"
+        )
+        report.append(
+            f"    Binding evidence: parameter #{binding['position']} uses ${binding['variable']} (type {binding['type']}) at {report_path(statement['file'])}:{binding['line']}."
+        )
+        report.append(
+            f"    Execute evidence: {report_path(statement['file'])}:{execute_line} {flow['execute_text']}"
+        )
+        described_guards = set()
+        for edge in binding["edges"]:
+            if edge and edge[0] == "source-assignment":
+                _, assignment_file, assignment_line, destination, method, key = edge
+                report.append(
+                    f"    Assignment evidence: {report_path(assignment_file)}:{assignment_line} ${destination} receives [{method}] {key}."
+                )
+            elif edge and edge[0] == "guard":
+                _, guard_file, guard_line, condition, arm = edge
+                guard_key = (guard_file.resolve(), guard_line, condition, arm)
+                if guard_key not in described_guards:
+                    described_guards.add(guard_key)
+                    report.append(
+                        f"    Guard condition: if ({condition}) at {report_path(guard_file)}:{guard_line}; {arm} path evidence. The condition is not treated as validation or sanitization."
+                    )
+            elif edge and len(edge) == 4 and isinstance(edge[0], Path):
+                assignment_file, assignment_line, source, destination = edge
+                report.append(
+                    f"    Assignment evidence: {report_path(assignment_file)}:{assignment_line} ${destination} references ${source}."
+                )
+        for guard_file, guard_line, condition, arm in flow["guards"]:
+            guard_key = (guard_file.resolve(), guard_line, condition, arm)
+            if guard_key in described_guards:
+                continue
+            described_guards.add(guard_key)
+            report.append(
+                f"    Guard condition: if ({condition}) at {report_path(guard_file)}:{guard_line}; {arm} path evidence. The condition is not treated as validation or sanitization."
+            )
+        report.append(
+            "    This value is represented as a bound parameter, not concatenated into the SQL text; this statement alone does not establish application-wide security."
+        )
+    if object_access_observations:
+        report.extend([
+            "",
+            "Object-level access-control review observations (not vulnerability findings):",
+        ])
+        seen_object_observations = set()
+        for observation in object_access_observations:
+            identity = (
+                observation["method"], observation["key"],
+                observation["source_file"].resolve(), observation["source_line"],
+                observation["sink_file"].resolve(), observation["sink_line"],
+            )
+            if identity in seen_object_observations:
+                continue
+            seen_object_observations.add(identity)
+            report.append(
+                f"  Request identifier [{observation['method']}] {observation['key']} at "
+                f"{report_path(observation['source_file'])}:{observation['source_line']} "
+                f"reaches {observation['sink_type']} at "
+                f"{report_path(observation['sink_file'])}:{observation['sink_line']}."
+            )
+            if observation["tracked_variables"]:
+                report.append(
+                    "    Tracked variable(s): "
+                    + ", ".join(observation["tracked_variables"])
+                    + "; assignment evidence is listed in Source-flow evidence."
+                )
+            authorization_guards = []
+            for guard in observation["guards"]:
+                classification = is_authorization_like_guard(
+                    guard[2], observation["tracked_variables"]
+                )
+                if classification:
+                    authorization_guards.append((guard, classification))
+            if authorization_guards:
+                for (guard_file, guard_line, condition, arm), classification in authorization_guards:
+                    report.append(
+                        f"    Authorization-like condition observed at "
+                        f"{report_path(guard_file)}:{guard_line}: if ({condition}) ({arm})."
+                    )
+                    if classification[0] == "helper":
+                        helper_file, helper_line, helper_name = classification[1]
+                        report.append(
+                            f"      Local helper evidence: {helper_name} at "
+                            f"{report_path(helper_file)}:{helper_line} contains a supported "
+                            "parameter-to-principal/owner comparison. This does not prove the helper is complete or effective."
+                        )
+                report.append(
+                    "    The condition is structural evidence only; JARVIS does not establish that it checks the requested object's owner or tenant, denies the unauthorized path, or is correct at runtime."
+                )
+            else:
+                report.append(
+                    "    No supported authorization-like condition was recognized on this captured path. This does not prove that authorization is missing; checks may exist in middleware, helpers, included code, database policy, or other paths outside the supported analysis."
+                )
+            report.extend([
+                "    Finding confidence: Low; request-to-database flow is evidence for review, not proof of an object-level access flaw.",
+                "    Severity: NEEDS_REVIEW; impact, affected object, caller permissions, and complete authorization context are not established.",
+                "    Vulnerability status: UNCONFIRMED.",
+                "    Review guidance: inspect the complete server-side call chain and verify that each requested object is authorized against the authenticated principal or tenant.",
+            ])
+    report.extend(["", "URL-fetch / SSRF review observations (not vulnerability findings):"])
+    if ssrf_review_observations:
+        seen_ssrf_observations = set()
+        for observation in ssrf_review_observations:
+            identity = (
+                observation["method"], observation["key"],
+                observation["source_file"].resolve(), observation["source_line"],
+                observation["sink_file"].resolve(), observation["sink_line"],
+            )
+            if identity in seen_ssrf_observations:
+                continue
+            seen_ssrf_observations.add(identity)
+            report.append(
+                f"  Request input [{observation['method']}] {observation['key']} at "
+                f"{report_path(observation['source_file'])}:{observation['source_line']} "
+                f"has a supported flow to file_get_contents() at "
+                f"{report_path(observation['sink_file'])}:{observation['sink_line']}."
+            )
+            if observation["variables"]:
+                report.append(
+                    "    Tracked URL variable(s): "
+                    + ", ".join(observation["variables"])
+                    + "; assignment evidence appears above in Source-flow evidence."
+                )
+            for guard_file, guard_line, condition, arm in observation["guards"]:
+                report.append(
+                    f"    Nearby guard evidence: if ({condition}) at "
+                    f"{report_path(guard_file)}:{guard_line} ({arm}); condition alone is not proof of validation."
+                )
+            if observation["checks"]:
+                for guard_file, guard_line, condition, arm, check_type in observation["checks"]:
+                    report.append(
+                        f"    Recognized {check_type} evidence at "
+                        f"{report_path(guard_file)}:{guard_line}: if ({condition}) ({arm})."
+                    )
+                    if check_type == "URL-format validation":
+                        report.append(
+                            "      URL-format validation does not establish an allowed host, scheme, resolved address, redirect policy, or safe destination."
+                        )
+                    else:
+                        report.append(
+                            "      Allowlist contents, URL-to-entry equivalence, and enforcement on every path are not established."
+                        )
+            else:
+                report.append(
+                    "    No supported URL validation or allowlist condition was recognized on this captured path; this does not prove checks are absent elsewhere."
+                )
+            report.extend([
+                "    Static request-to-URL-fetch flow does not prove that a remote request occurs or that an internal/restricted destination is reachable.",
+                "    Finding confidence: Low; destination control, URL parsing, redirects, network policy, and runtime behavior are unresolved.",
+                "    Severity: NEEDS_REVIEW; impact and exploitability are not established.",
+                "    Vulnerability status: UNCONFIRMED.",
+            ])
+    else:
+        report.append(
+            "  No supported request-controlled flow to file_get_contents() was established. Fixed URLs and unsupported or ambiguous network APIs are not SSRF findings in this review."
+        )
+    report.extend(["", "Command-execution / command-injection review observations (not vulnerability findings):"])
+    if command_injection_observations:
+        seen_command_observations = set()
+        for observation in command_injection_observations:
+            identity = (
+                observation["method"], observation["key"],
+                observation["source_file"].resolve(), observation["source_line"],
+                observation["sink_file"].resolve(), observation["sink_line"],
+                observation["sink_type"],
+            )
+            if identity in seen_command_observations:
+                continue
+            seen_command_observations.add(identity)
+            operation = observation["sink_type"].rsplit(": ", 1)[-1]
+            report.append(
+                f"  Request input [{observation['method']}] {observation['key']} at "
+                f"{report_path(observation['source_file'])}:{observation['source_line']} "
+                f"has a supported flow to {operation}() at "
+                f"{report_path(observation['sink_file'])}:{observation['sink_line']}."
+            )
+            if observation["variables"]:
+                report.append(
+                    "    Tracked command variable(s): "
+                    + ", ".join(observation["variables"])
+                    + "; assignment evidence appears above in Source-flow evidence."
+                )
+            if observation["transformations"]:
+                for transformation in observation["transformations"]:
+                    note = transformation_context_note(
+                        transformation["category"], observation["sink_type"]
+                    )
+                    report.append(
+                        f"    Transformation evidence: {transformation['expression']} at "
+                        f"{report_path(transformation['file'])}:{transformation['line']} "
+                        f"({transformation['basis']}); {note}"
+                    )
+            else:
+                report.append(
+                    "    No recognized shell-argument handling transformation was observed in this captured trace; this does not establish that none exists elsewhere."
+                )
+            report.extend([
+                "    Static flow does not establish shell interpretation, attacker control of metacharacters, argument position, executable behavior, or runtime command effects.",
+                "    Finding confidence: Low; command composition and runtime behavior remain unverified.",
+                "    Severity: NEEDS_REVIEW; exploitability and impact are not established.",
+                "    Vulnerability status: UNCONFIRMED.",
+                "    Review guidance: prefer fixed executable paths with argument-array APIs and keep untrusted values in distinct arguments; validate the required type and domain.",
+            ])
+    else:
+        report.append(
+            "  No supported request-controlled flow to an OS command-execution function was established. Static commands, unresolved helper-built commands, and object methods such as $database->exec() are not command-injection findings in this review."
+        )
+    report.extend(["", "File-access / path-traversal review observations (not vulnerability findings):"])
+    if file_access_observations:
+        seen_file_observations = set()
+        for observation in file_access_observations:
+            identity = (
+                observation["method"], observation["key"],
+                observation["source_file"].resolve(), observation["source_line"],
+                observation["sink_file"].resolve(), observation["sink_line"],
+                observation["operation"],
+            )
+            if identity in seen_file_observations:
+                continue
+            seen_file_observations.add(identity)
+            report.append(
+                f"  Request input [{observation['method']}] {observation['key']} at "
+                f"{report_path(observation['source_file'])}:{observation['source_line']} "
+                f"has a supported flow to {observation['operation']}() at "
+                f"{report_path(observation['sink_file'])}:{observation['sink_line']}."
+            )
+            if observation["variables"]:
+                report.append(
+                    "    Tracked path variable(s): "
+                    + ", ".join(observation["variables"])
+                    + "; assignment evidence appears above in Source-flow evidence."
+                )
+            for transform_file, transform_line, transform_name, expression, category, basis in observation["transformations"]:
+                report.append(
+                    f"    Path transformation evidence: {expression} ({transform_name}) at "
+                    f"{report_path(transform_file)}:{transform_line} ({basis}); "
+                    f"{transformation_context_note(category, observation['operation'])}"
+                )
+            for guard_file, guard_line, condition, arm in observation["guards"]:
+                report.append(
+                    f"    Guard evidence: if ({condition}) at {report_path(guard_file)}:{guard_line} "
+                    f"({arm}); path condition only, not proof of containment or validation."
+                )
+            if observation["base_checks"]:
+                for guard_file, guard_line, condition, arm, check_type in observation["base_checks"]:
+                    report.append(
+                        f"    Recognized {check_type} at {report_path(guard_file)}:{guard_line}: "
+                        f"if ({condition}) ({arm})."
+                    )
+                    report.append(
+                        "      Canonical-path equality, path-separator boundaries, symlink behavior, and rejection of failed canonicalization are not established."
+                    )
+            else:
+                report.append(
+                    "    No supported base-directory prefix check was recognized on this captured path; this does not prove validation or confinement is absent elsewhere."
+                )
+            report.extend([
+                "    Static request-to-file-read flow does not prove traversal, access outside an intended directory, a successful read, or sensitive-data impact.",
+                "    Finding confidence: Low; canonical path, effective base restriction, file permissions, and runtime behavior are unresolved.",
+                "    Severity: NEEDS_REVIEW; exploitability and impact are not established.",
+                "    Vulnerability status: UNCONFIRMED.",
+                "    Review guidance: canonicalize the candidate and intended base, enforce separator-aware containment after canonicalization, handle failure closed, and keep file access within the authorized root.",
+            ])
+    else:
+        report.append(
+            "  No supported request-controlled flow to file_get_contents() or readfile() was established. Fixed paths, unresolved helper-built paths, and unsupported file APIs are not path-traversal findings in this review."
+        )
     if not confirmed:
         report.append("  No supported source-to-sink relationship established.")
-    report.extend(["", "Local function analysis:", "  Only unique, straight-line parameter aliases with one direct return and trailing literal optional defaults are summarized.", "  Function names do not establish sanitization or vulnerability status.", "  Unknown function behavior and sanitization effectiveness are not inferred.", "", "Included-file analysis:"])
+    report.extend([
+        "", "Local function analysis:",
+        "  Unique straight-line parameter aliases and complete simple switch branches with literal labels may be summarized.",
+        "  Function behavior and sanitization effectiveness are not inferred for unresolved bodies; recognized transform expressions retain argument provenance only, and effectiveness for an output context is not inferred.",
+        "  Unsupported function bodies or call expressions remain unresolved; request provenance is reported separately.",
+        "  Request provenance retained for unsupported calls identifies a source reference, not a verified transformed value or complete stored-data flow.",
+        "", "Database operation observations:",
+    ])
+    if database_observations:
+        for label, file, number, text in database_observations:
+            report.append(f"  {label} at {report_path(file)}:{number}: {text}")
+        report.append(
+            "  The presence of database writes, retrievals, and output observations does not establish a joined stored-data flow; shared table names alone are insufficient."
+        )
+    else:
+        report.append("  No supported SQL statement construction or local query execution pairing detected.")
+    report.extend(["", "Stored-data provenance observations:"])
+    if stored_data_observations or stored_data_flows or unresolved_stored_data:
+        for observation in dict.fromkeys(stored_data_observations):
+            report.append(f"  {observation}")
+        report.append("  SELECT-to-output provenance:")
+        if select_output_flows:
+            for flow in select_output_flows:
+                read = flow["read"]
+                query = read["query"]
+                output = flow["output"]
+                projection = ", ".join(query["columns"])
+                if query.get("where_supported") and query.get("where"):
+                    where_evidence = f"WHERE {query['where'][0]} = {query['where'][1]}"
+                elif query.get("where_text") and not query.get("where_supported"):
+                    where_evidence = f"WHERE predicate unresolved ({query['where_text']})"
+                else:
+                    where_evidence = "no WHERE predicate"
+                fetch = output["fetch"]
+                report.append(
+                    f"    Supported SELECT-to-output path: SELECT {projection} FROM {query['table']} at {report_path(query['file'])}:{query['line']} "
+                    f"({where_evidence}); query execution at {report_path(read['execution_file'])}:{read['execution_line']}; "
+                    f"{fetch['method']} assigns result to ${fetch['row_variable']} at {report_path(fetch['file'])}:{fetch['line']}; "
+                    f"output at {report_path(output['file'])}:{output['line']} uses ${output['row_variable']} column {output['column']}: {output['text']}."
+                )
+                helper = output.get("helper")
+                if helper:
+                    if helper["category"] == "identity":
+                        helper_note = "identity return."
+                    elif helper["category"] == "quote-escaping":
+                        helper_note = transformation_context_note(
+                            helper["category"], "output"
+                        )
+                    elif helper["category"] == "html-output-encoding":
+                        helper_note = "HTML output encoding, not SQL escaping; effectiveness for the specific output context is not inferred."
+                    elif helper["category"] == "sql-escaping":
+                        helper_note = "SQL escaping, not HTML output encoding; effectiveness for HTML output is not inferred."
+                    else:
+                        helper_note = "transformation category is unresolved."
+                    report.append(
+                        f"      Helper return evidence: {helper['name']} definition at {report_path(helper['file'])}:{helper['definition_line']} "
+                        f"receives {helper['argument']} in parameter ${helper['parameter']} and returns {helper['return_expression']} "
+                        f"at {report_path(helper['file'])}:{helper['return_line']} ({helper_note} Transformation effectiveness is not inferred.)"
+                    )
+                for guard_file, guard_line, condition, arm in flow["guards"]:
+                    report.append(
+                        f"      Guard condition: {condition} at {report_path(guard_file)}:{guard_line} ({arm}); path evidence only."
+                    )
+                report.append(
+                    "      This links the observed SELECT result to the output expression; it does not identify a particular earlier INSERT or confirm runtime database contents."
+                )
+        else:
+            report.append("    No supported SELECT-to-output path established.")
+        for flow in stored_data_flows:
+            write = flow["write"]
+            read = flow["read"]
+            query = write["query"]
+            read_query = read["query"]
+            output_file, output_line, output_column, output_text, _ = flow["output"]
+            fetches = read.get("fetches", [])
+            fetch_evidence = "; ".join(
+                f"{fetch['method']} at {report_path(fetch['file'])}:{fetch['line']} "
+                f"assigns ${fetch['row_variable']} ({fetch['text']})"
+                for fetch in fetches
+            ) or "fetch location unresolved"
+            source_method, source_key, source_file, source_line = write["origin"]["source"]
+            path_label = "Conditional stored-data path" if flow["guards"] else "Supported stored-data path"
+            report.append(
+                f"  {path_label}: [{source_method}] {source_key} at {report_path(source_file)}:{source_line} "
+                f"is assigned to ${write['value_variable']} at {report_path(write['origin']['assignments'][-1][0])}:{write['origin']['assignments'][-1][1]}, "
+                f"written to {query['table']}.{write['column']} by INSERT construction at {report_path(query['file'])}:{query['line']} "
+                f"and execution at {report_path(write['execution_file'])}:{write['execution_line']}; "
+                f"the matching key predicate is read by SELECT at {report_path(read_query['file'])}:{read_query['line']} "
+                f"and executed at {report_path(read['execution_file'])}:{read['execution_line']}; {fetch_evidence}; "
+                f"retrieved column {output_column} is observed in output at {report_path(output_file)}:{output_line}: {output_text}."
+            )
+            for guard_file, guard_line, condition, arm in flow["guards"]:
+                report.append(
+                    f"    Guard condition: {condition} at {report_path(guard_file)}:{guard_line} ({arm}); path evidence only, not validation or sanitization."
+                )
+            report.append(
+                "    This is static source evidence for a possible row path; query success, database contents, helper effectiveness, and runtime output were not verified."
+            )
+        for item in dict.fromkeys(unresolved_stored_data):
+            report.append(f"  Unresolved stored-data relationship: {item}")
+        if not stored_data_flows:
+            report.append(
+                "  No supported request-to-write-to-read-to-output path established; the listed stages remain separate where provenance or row identity is unresolved."
+            )
+    else:
+        report.append(
+            "  No supported request-to-write-to-read-to-output relationship established; database operations remain separate observations."
+        )
+    report.extend(["", "Prepared-statement observations:"])
+    if prepared_statement_observations:
+        for statement in prepared_statement_observations:
+            query = statement["query"]
+            if query and query["supported"]:
+                report.append(
+                    f"  Query text at {report_path(statement['file'])}:{query['query_line']}: {query['query_text']}"
+                )
+                report.append(
+                    f"  Observed {query['placeholder_count']} positional placeholder(s); prepare call at {report_path(statement['file'])}:{statement['prepare_line']}."
+                )
+                report.append(f"  Prepare expression: {statement['prepare_text']}")
+            else:
+                report.append(
+                    f"  Prepare call observed at {report_path(statement['file'])}:{statement['prepare_line']}: {statement['prepare_text']}"
+                )
+            if statement["bindings"]:
+                for binding in statement["bindings"]:
+                    report.append(
+                        f"  Bound parameter #{binding['position']} uses ${binding['variable']} (type {binding['type']}) at {report_path(statement['file'])}:{binding['line']}."
+                    )
+            elif query and query.get("placeholder_count") == 0:
+                report.append("  No positional parameter bindings were present in the observed query.")
+            if statement["execute_lines"]:
+                for execute_line, execute_text, _ in statement["execute_lines"]:
+                    report.append(
+                        f"  Execution call observed at {report_path(statement['file'])}:{execute_line}: {execute_text}"
+                    )
+            if statement["unresolved"]:
+                report.append(
+                    f"  Parameter mapping remains unresolved: {statement['unresolved']}."
+                )
+        report.append(
+            "  These are source observations; a prepared statement here does not establish that the entire application is secure."
+        )
+    else:
+        report.append("  No supported prepare/bind/execute sequence detected.")
+    report.extend(["", "Output branch observations:"])
+    output_observations = [item for item in sink_observations if item[0] == "output"]
+    if output_observations:
+        for _, file, number, excerpt, context in output_observations:
+            report.append(
+                f"  Output branch observation at {report_path(file)}:{number}: {excerpt}{context}"
+            )
+        report.append(
+            "  The output expression is recorded as source text; helper names and branch presence alone do not establish encoder behavior or exploitability."
+        )
+    else:
+        report.append("  No output sink observations detected.")
+    report.extend(["", "Included-file analysis:"])
     report.extend(includes or ["  No supported include statements detected."])
     report.extend(["", "Unresolved analysis candidates:"])
     report.extend(unresolved or ["  None detected."])
@@ -3090,7 +6284,9 @@ def _trace_php_flow(path, source, reports_dir):
         "  Unsupported syntax and ambiguous paths remain unresolved.",
     ])
     status = (
-        "CONDITIONAL SOURCE PATTERNS; FLOW NOT ESTABLISHED"
+        "CONDITIONAL SOURCE-TO-SINK PATHS ESTABLISHED"
+        if confirmed and helper_branch_flow_confirmed and not unconditional_confirmed
+        else "CONDITIONAL SOURCE PATTERNS; FLOW NOT ESTABLISHED"
         if confirmed and not unconditional_confirmed
         else "SOURCE PATTERNS DETECTED"
         if confirmed
@@ -3121,12 +6317,25 @@ def _trace_php_flow(path, source, reports_dir):
     ):
         report.append("  INCLUDED-FILE INPUT EVIDENCE ALSO PRESENT")
     report.extend(["  Input detection, source-to-sink tracing, and vulnerability confirmation are separate assessments.", "  Unsupported syntax and ambiguous conditional paths remain unresolved.", "", "JARVIS assessment:", "  These source patterns are review evidence only; no vulnerability is confirmed."])
-    text = "\n".join(report)
+    if confirmed:
+        report.extend([
+            "",
+            *_source_flow_severity_lines(
+                "SQL injection, output injection, or dangerous server-side operation candidate",
+                ["Input evidence and source-flow evidence sections"],
+                ["Sink observations and source-flow evidence sections"],
+            ),
+        ])
+    if provenance is not None:
+        report.extend([
+            "",
+            *_format_source_analysis_provenance(
+                provenance, source_text_by_file
+            ),
+        ])
+    text = _redact_potential_secrets("\n".join(report))
     print("\n" + text)
-    reports_dir.mkdir(exist_ok=True)
-    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", path.stem).strip("_").lower()
-    report_file = reports_dir / f"{safe_name}_php_flow.txt"
-    report_file.write_text(text + "\n")
+    report_file = _write_php_flow_report(path, text + "\n", reports_dir)
     print(f"\nJARVIS: PHP flow evidence saved to {report_file}")
 
 
@@ -3137,13 +6346,461 @@ def analyze_php_flow(file_path):
         print("JARVIS: PHP file not found.")
         return
 
+    provenance = _begin_source_analysis_provenance()
     try:
         source = path.read_text(errors="ignore")
     except OSError as e:
         print(f"JARVIS: Could not read PHP file: {e}")
         return
 
-    return _trace_php_flow(path, source, REPORTS_DIR)
+    return _trace_php_flow(path, source, REPORTS_DIR, provenance=provenance)
+
+
+_JS_FLOW_SUPPORTED_EXTENSIONS = {".js", ".mjs", ".cjs"}
+_JS_FLOW_SOURCE_EXPRESSIONS = {
+    "location.search": "URL query string",
+    "window.location.search": "URL query string",
+    "location.hash": "URL fragment",
+    "window.location.hash": "URL fragment",
+    "document.referrer": "document referrer",
+    "window.name": "window name",
+    "event.data": "message event data",
+    "e.data": "message event data",
+}
+
+
+def _js_flow_strip_line_comment(line):
+    """Remove a JavaScript line comment while preserving quoted strings."""
+    quote_char = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote_char:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote_char:
+                quote_char = None
+        elif char in {"'", '"'}:
+            quote_char = char
+        elif line[index:index + 2] == "//":
+            return line[:index]
+        index += 1
+    return line
+
+
+def _js_flow_mask_string_literals(line):
+    """Mask quoted literal contents before checking syntax markers."""
+    masked = list(line)
+    quote_char = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote_char:
+            masked[index] = " "
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote_char:
+                quote_char = None
+        elif char in {"'", '"'}:
+            quote_char = char
+            masked[index] = " "
+    return "".join(masked)
+
+
+def _js_flow_clean_expression(expression):
+    expression = expression.strip().rstrip(";").strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        expression = expression[1:-1].strip()
+    return expression
+
+
+def _js_flow_source_kind(expression):
+    return _JS_FLOW_SOURCE_EXPRESSIONS.get(
+        _js_flow_clean_expression(expression)
+    )
+
+
+def _js_flow_secret_literal(line):
+    """Return a secret-like identifier for a non-placeholder string literal."""
+    match = re.fullmatch(
+        r"(?:export\s+)?(?:(?:const|let|var)\s+)?"
+        r"(?P<name>[A-Za-z_$][\w$-]*)\s*(?:=|:)\s*"
+        r"(?P<quote>['\"])(?P<value>[^'\"\r\n]{8,})(?P=quote)\s*[,;]?",
+        line.strip(),
+    )
+    if not match:
+        return None
+    name = match.group("name")
+    if not re.search(
+        r"(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
+        r"auth[_-]?token|private[_-]?key|password|passwd|secret|token)",
+        name,
+        re.I,
+    ):
+        return None
+    value = match.group("value").strip().casefold()
+    if (
+        not value
+        or re.fullmatch(r"(?:your|replace|change|insert|enter)[_-].*", value)
+        or re.fullmatch(r"(?:example|sample|dummy|test)[_-].*", value)
+        or re.fullmatch(r"(?:example|sample|dummy|test|changeme|change_me|"
+                        r"placeholder|redacted|not[-_ ]?a[-_ ]?real[-_ ]?secret|"
+                        r"none|null|undefined|x{3,}|0{6,})", value)
+        or value.startswith("<") and value.endswith(">")
+    ):
+        return None
+    return name
+
+
+def _js_flow_client_auth_identifiers(line):
+    """Find role/permission identifiers in simple client-side if conditions."""
+    masked = _js_flow_mask_string_literals(line)
+    branch = re.search(r"\bif\s*\(\s*([^()\n]+)\s*\)", masked)
+    if not branch:
+        return []
+    return list(dict.fromkeys(re.findall(
+        r"\b(?:is_?admin|is_?owner|is_?authorized|is_?authenticated|"
+        r"role|permission|permissions|can[A-Z]\w*|has[A-Z]\w*)\b",
+        branch.group(1),
+        re.I,
+    )))
+
+
+def _analyze_js_flow_source(path, source):
+    """Trace a deliberately small, line-oriented JavaScript subset."""
+    path = Path(path)
+    assignments = {}
+    url_search_params = {}
+    write_counts = {}
+    invalid_variables = set()
+    candidates = []
+    secret_literals = []
+    client_auth_observations = []
+    unresolved = []
+    control_flow = re.compile(
+        r"\b(if|else|for|while|switch|try|catch|finally)\b|[?:]|&&|\|\|"
+    )
+    declaration_or_assignment = re.compile(
+        r"^(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+?)\s*;?$"
+    )
+    url_search_params_constructor = re.compile(
+        r"^new\s+URLSearchParams\(\s*(location\.search|window\.location\.search)\s*\)$"
+    )
+    url_search_params_get = re.compile(
+        r"^([A-Za-z_$][\w$]*)\.get\(\s*(['\"])([^'\"]+)\2\s*\)$"
+    )
+    inner_html_assignment = re.compile(
+        r"^((?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*|document\.getElementById\(\s*(?:'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\")\s*\)))\.innerHTML\s*=\s*(.+?)\s*;?$"
+    )
+
+    for line_number, raw_line in enumerate(source.splitlines(), 1):
+        line = _js_flow_strip_line_comment(raw_line).strip()
+        if not line:
+            continue
+        secret_name = _js_flow_secret_literal(line)
+        if secret_name:
+            secret_literals.append((line_number, secret_name))
+        auth_identifiers = _js_flow_client_auth_identifiers(line)
+        if auth_identifiers:
+            client_auth_observations.append((line_number, auth_identifiers))
+        if "`" in line:
+            template_sink = inner_html_assignment.fullmatch(line)
+            simple_template = None
+            if template_sink:
+                simple_template = re.fullmatch(
+                    r'`\$\{([A-Za-z_$][\w$]*)\}`',
+                    template_sink.group(2).strip(),
+                )
+            if simple_template:
+                # Preserve the original .innerHTML sink for the matcher below.
+                pass
+            else:
+                unresolved.append(
+                    f"Line {line_number}: template literal syntax is unsupported."
+                )
+                continue
+        if control_flow.search(_js_flow_mask_string_literals(line)):
+            unresolved.append(
+                f"Line {line_number}: control flow or compound expression is unsupported; traces in this file are withheld."
+            )
+            candidates = []
+            break
+
+        sink_match = inner_html_assignment.fullmatch(line)
+        if sink_match:
+            sink_expression = _js_flow_clean_expression(sink_match.group(2))
+            template_interpolation = re.fullmatch(
+                r'`\$\{([A-Za-z_$][\w$]*)\}`',
+                sink_expression,
+            )
+            if template_interpolation:
+                sink_expression = template_interpolation.group(1)
+            source_kind = _js_flow_source_kind(sink_expression)
+            steps = []
+            if source_kind:
+                source_line = line_number
+                source_expression = sink_expression
+                source_text = raw_line.strip()
+            elif re.fullmatch(r"[A-Za-z_$][\w$]*", sink_expression):
+                variable = sink_expression
+                trace = assignments.get(variable)
+                if trace and variable not in invalid_variables:
+                    source_kind, source_expression, source_line, source_text, steps = trace
+                else:
+                    continue
+            else:
+                continue
+            candidates.append({
+                "source_kind": source_kind,
+                "source_expression": source_expression,
+                "source_line": source_line,
+                "source_text": source_text,
+                "sink_object": sink_match.group(1),
+                "sink_expression": sink_expression,
+                "sink_line": line_number,
+                "sink_text": raw_line.strip(),
+                "steps": steps,
+            })
+            continue
+
+        # Compound writes are not modeled by this line-oriented analyzer.
+        # Invalidate a tracked identifier rather than retaining a stale trace.
+        compound_match = re.fullmatch(
+            r"([A-Za-z_$][\w$]*)\s*(?:\+=|-=|\*=|/=|%=|\*\*=|<<=|>>=|>>>=|&=|\|=|\^=)\s*.+?;?",
+            line,
+        )
+        if compound_match:
+            variable = compound_match.group(1)
+            if variable in assignments or variable in url_search_params or variable in invalid_variables:
+                assignments.pop(variable, None)
+                url_search_params.pop(variable, None)
+                invalid_variables.add(variable)
+                unresolved.append(
+                    f"Line {line_number}: compound assignment to {variable} makes later flows ambiguous."
+                )
+            else:
+                unresolved.append(
+                    f"Line {line_number}: compound assignment syntax is unsupported."
+                )
+            continue
+
+        assignment_match = declaration_or_assignment.fullmatch(line)
+        if assignment_match:
+            variable = assignment_match.group(1)
+            expression = _js_flow_clean_expression(assignment_match.group(2))
+            if write_counts.get(variable, 0) or variable in invalid_variables:
+                assignments.pop(variable, None)
+                url_search_params.pop(variable, None)
+                invalid_variables.add(variable)
+                write_counts[variable] = write_counts.get(variable, 0) + 1
+                unresolved.append(
+                    f"Line {line_number}: reassignment of {variable} makes later flows ambiguous."
+                )
+                continue
+            write_counts[variable] = 1
+
+            constructor_match = url_search_params_constructor.fullmatch(expression)
+            if constructor_match:
+                source_expression = constructor_match.group(1)
+                source_kind = _js_flow_source_kind(source_expression)
+                if source_kind:
+                    url_search_params[variable] = (
+                        source_kind, source_expression, line_number, raw_line.strip()
+                    )
+                else:
+                    invalid_variables.add(variable)
+                    unresolved.append(
+                        f"Line {line_number}: URLSearchParams source expression is unsupported."
+                    )
+                continue
+
+            get_match = url_search_params_get.fullmatch(expression)
+            if get_match:
+                receiver, _, parameter = get_match.groups()
+                constructor = url_search_params.get(receiver)
+                if constructor and receiver not in invalid_variables:
+                    source_kind, source_expression, source_line, source_text = constructor
+                    assignments[variable] = (
+                        source_kind, source_expression, source_line, source_text,
+                        [
+                            f"Line {source_line}: {source_text}",
+                            f"Line {line_number}: {variable} = {receiver}.get(\"{parameter}\")",
+                        ],
+                    )
+                else:
+                    unresolved.append(
+                        f"Line {line_number}: .get() receiver {receiver} is not connected to a supported URLSearchParams construction."
+                    )
+                continue
+
+            source_kind = _js_flow_source_kind(expression)
+            if source_kind:
+                assignments[variable] = (
+                    source_kind, expression, line_number, raw_line.strip(), []
+                )
+                continue
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", expression):
+                trace = assignments.get(expression)
+                if trace and expression not in invalid_variables:
+                    kind, origin, origin_line, origin_text, steps = trace
+                    assignments[variable] = (
+                        kind, origin, origin_line, origin_text,
+                        steps + [
+                            f"Line {line_number}: {variable} = {expression}"
+                        ],
+                    )
+                elif expression in invalid_variables:
+                    invalid_variables.add(variable)
+                    unresolved.append(
+                        f"Line {line_number}: alias source {expression} has an ambiguous prior assignment."
+                    )
+                continue
+            if re.fullmatch(r"(?:'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\")", expression):
+                continue
+            if ".get(" in expression or "URLSearchParams" in expression:
+                unresolved.append(
+                    f"Line {line_number}: unsupported URLSearchParams or .get() expression."
+                )
+                continue
+            # Unknown writes to a tracked value invalidate it. Other syntax is
+            # explicitly unresolved rather than interpreted as a flow.
+            if variable in assignments:
+                assignments.pop(variable, None)
+                invalid_variables.add(variable)
+            tracked_names = set(assignments) | invalid_variables
+            if any(
+                __import__("re").search(rf"\b{__import__('re').escape(name)}\b", expression)
+                for name in tracked_names
+            ):
+                unresolved.append(
+                    f"Line {line_number}: unsupported assignment expression involving tracked data."
+                )
+            continue
+
+        if "innerHTML" in line or "location." in line or "event.data" in line:
+            unresolved.append(
+                f"Line {line_number}: syntax relevant to source/sink tracing is unsupported."
+            )
+
+    report = [
+        "JARVIS Offline JavaScript Source-Flow Review",
+        f"File: {path}",
+        "Analysis mode: static source text only; JavaScript was not executed.",
+        "Supported subset: exact URL/referrer/window/message sources, URLSearchParams(location.search) followed by a static-key .get() assignment, simple identifier assignments and aliases, and single-line .innerHTML assignments.",
+        "",
+    ]
+    if candidates:
+        for number, candidate in enumerate(candidates, 1):
+            report.extend([
+                f"Candidate {number}: Potential unsafe HTML insertion",
+                "Vulnerability status: UNCONFIRMED",
+                f"Input source: {candidate['source_kind']} — {candidate['source_expression']} at {path.name}:{candidate['source_line']}",
+                f"Source evidence: {candidate['source_text']}",
+            ])
+            report.extend(
+                f"Assignment evidence: {step}"
+                for step in candidate["steps"]
+            )
+            report.extend([
+                f"Potential sink: {candidate['sink_object']}.innerHTML at {path.name}:{candidate['sink_line']}",
+                f"Sink evidence: {candidate['sink_text']}",
+                "Reasoning: a recognized untrusted source is directly traceable to an innerHTML assignment in the supported syntax subset.",
+                *_source_flow_severity_lines(
+                    "cross-site scripting / unsafe HTML rendering",
+                    [f"{path.name}:{candidate['source_line']}"],
+                    [f"{path.name}:{candidate['sink_line']}"],
+                ),
+                "Limitations: this static trace does not prove runtime reachability, attacker control, browser parsing, or exploitability; intervening runtime behavior and unsupported syntax may change the result.",
+                "Remediation: use textContent for plain text, or apply a vetted context-appropriate HTML sanitizer when HTML rendering is required.",
+                "",
+            ])
+    else:
+        report.append("No complete supported source-to-innerHTML trace detected.")
+    if secret_literals:
+        report.extend(["", "Potential hard-coded secret-like literals:"])
+        for number, name in secret_literals:
+            report.extend([
+                f"  Candidate: {name} at {path.name}:{number}",
+                "  Vulnerability status: UNCONFIRMED",
+                "  Severity: NEEDS_REVIEW",
+                "  Severity confidence: Low; validity, permissions, reachability, and impact are unknown.",
+                "  Finding confidence: Low; the literal may be a placeholder, inactive value, or non-credential.",
+                "  Pattern confidence: High that a secret-named variable/property has a non-placeholder string literal.",
+                f"  Evidence: {path.name}:{number}: {name} = \"[REDACTED]\" (literal value withheld).",
+                "  Impact hypothesis: if the literal is a valid privileged credential included in client-delivered code, users may be able to recover and misuse it.",
+                "  Limitations: static text cannot establish credential validity, privilege, distribution, or whether the value is a harmless test constant.",
+                "  Remediation: keep privileged credentials server-side; rotate the value if it is confirmed to be active.",
+                "",
+            ])
+    if client_auth_observations:
+        report.extend([
+            "Client-side authorization-related review notes (not vulnerability findings):",
+        ])
+        for number, identifiers in client_auth_observations:
+            report.append(
+                f"  {path.name}:{number}: condition references {', '.join(identifiers)}."
+            )
+        report.extend([
+            "  These are client-side code observations only. They do not establish a server-side authorization failure, IDOR, privilege escalation, or account takeover.",
+            "  Review the corresponding server-side handler or API authorization code if it is available and authorized for local analysis.",
+        ])
+    if unresolved:
+        report.extend(["Unresolved or unsupported evidence:", *[f"  {item}" for item in unresolved]])
+    report.extend([
+        "",
+        "Assessment: candidates are pattern-based review leads only; no vulnerability is confirmed.",
+    ])
+    return _redact_potential_secrets("\n".join(report) + "\n")
+
+
+def _write_js_flow_report(path, report, reports_dir=None):
+    report = _redact_potential_secrets(report)
+    reports_dir = Path(reports_dir) if reports_dir is not None else Path(REPORTS_DIR)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(path).stem).strip("_").lower() or "javascript"
+    source_hash = hashlib.sha256(str(Path(path).resolve()).encode("utf-8")).hexdigest()[:10]
+    base = f"{safe_stem}_{source_hash}_js_flow"
+    for index in range(1000):
+        suffix = "" if index == 0 else f"_{index}"
+        report_file = reports_dir / f"{base}{suffix}.txt"
+        try:
+            with report_file.open("x", encoding="utf-8") as handle:
+                handle.write(report)
+            return report_file
+        except FileExistsError:
+            continue
+    raise OSError("Could not allocate a unique JavaScript report filename")
+
+
+def analyze_js_flow(file_path):
+    path = Path(file_path)
+    if not path.is_file() or path.suffix.lower() not in _JS_FLOW_SUPPORTED_EXTENSIONS:
+        print("JARVIS: JavaScript file not found or unsupported; use a local .js, .mjs, or .cjs file.")
+        return
+    provenance = _begin_source_analysis_provenance()
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        print(f"JARVIS: Could not read JavaScript file: {error}")
+        return
+    report = _analyze_js_flow_source(path, source).rstrip() + "\n\n"
+    report += "\n".join(
+        _format_source_analysis_provenance(
+            provenance, {path.resolve(): source}, source_read_errors="replace"
+        )
+    ) + "\n"
+    report = _redact_potential_secrets(report)
+    print("\n" + report)
+    try:
+        report_file = _write_js_flow_report(path, report)
+    except OSError as error:
+        print(f"JARVIS: Could not save JavaScript report: {error}")
+        return
+    print(f"JARVIS: JavaScript flow evidence saved to {report_file}")
 
 
 def php_summary(directory):
@@ -3322,6 +6979,32 @@ def php_review_checklist():
     print("\nJARVIS: Checklist only.")
     print("JARVIS: No exploit requests or vulnerability confirmation performed.")
 
+
+def hackerone_policy_review_checklist():
+    """Print a manual checklist based on the user-supplied Anthropic policy summary."""
+    items = [
+        "Verify the exact asset, scheme, port, and path are explicitly authorized in current scope.",
+        "Confirm every proposed testing method is allowed by the current program rules.",
+        "Manually reproduce a security impact; scanner or AI alerts remain unverified.",
+        "Provide safe, repeatable steps and enough evidence for another researcher to reproduce.",
+        "Check the current official program policy for exclusions; this supplied checklist may be outdated.",
+        "Check for duplicates or a shared root cause, including the Claude Code permission-modal bypass remediation.",
+        "Demonstrate the issue without accessing other users' accounts, private data, or causing disruption.",
+        "Include only the minimum evidence needed; redact credentials, tokens, and private information.",
+        "Do not test denial of service, disruptive behavior, brute force, or unauthenticated rate limits.",
+        "Do not test social engineering, phishing, or accounts you do not own.",
+        "Clickjacking requires a sensitive action; missing cookie flags alone are not sufficient.",
+        "Generic TLS or security best-practice issues need working proof of impact.",
+        "Model jailbreaks, harmful outputs, and hallucinations may be excluded under the technical program.",
+    ]
+    print("\nJARVIS: Anthropic HackerOne Policy Review Checklist (manual review only)")
+    print("=======================================================================")
+    for item in items:
+        print(f"[ ] {item}")
+    print("\nThis is a review aid based on supplied policy text, not current authorization.")
+    print("It does not validate eligibility, severity, exploitability, or bounty status.")
+    print("All automated and AI-generated alerts remain unverified until manually validated.")
+
 def get_info(target):
 
     if not check_scope(target):
@@ -3332,6 +7015,7 @@ def get_info(target):
     print("\nJARVIS WEB INFORMATION REPORT")
     print("================================\n")
 
+    response = None
     try:
 
         response = scoped_get(
@@ -3426,6 +7110,9 @@ Further testing and human review are required before classifying a security find
 
         print(f"JARVIS: Unable to connect to {_render_report_target(target)}.")
         print(f"JARVIS: Request failed ({type(error).__name__}).")
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _build_findings_summary(reports_dir, only_report=None):
@@ -3459,6 +7146,7 @@ def _build_findings_summary(reports_dir, only_report=None):
     remediation_guidance = []
     analysis_statements = []
     review_priorities = []
+    structured_test_observations = []
     location_pattern = re.compile(
         r"(?P<file>(?:[A-Za-z]:)?[^\s:]+?\.(?:php|py|js|html|sql)):(?P<line>\d+)",
         re.I,
@@ -3479,8 +7167,21 @@ def _build_findings_summary(reports_dir, only_report=None):
             "describe your ", "enter your ", "add your ", "unknown;", "no evidence was",
         ))
 
+    def safe_summary_value(value):
+        rendered = _escape_report_user_field(" ".join(str(value).split()))
+        for field_label in (
+            "Vulnerability status", "Review status", "Severity assessment",
+            "Severity rationale", "Severity",
+        ):
+            rendered = re.sub(
+                rf"(?i){re.escape(field_label)}\s*:",
+                lambda match: match.group(0)[:-1] + r"\x3a",
+                rendered,
+            )
+        return rendered
+
     def add_record(kind, report_name, file_name=None, line_number=None, evidence=""):
-        excerpt = " ".join(str(evidence).split()) or "Unknown; no evidence excerpt was recorded."
+        excerpt = safe_summary_value(evidence) or "Unknown; no evidence excerpt was recorded."
         location = (
             str(Path(file_name)) if file_name else None,
             line_number,
@@ -3507,7 +7208,7 @@ def _build_findings_summary(reports_dir, only_report=None):
             unknown_reports.append(report_name)
             continue
 
-        lines = text.splitlines()
+        lines = _split_saved_report_lines(text)
         first_line = next((line.strip() for line in lines if line.strip()), "")
         is_php_flow = first_line.startswith("JARVIS: PHP source-flow analysis")
         is_candidate = first_line.startswith("[+] Vulnerability candidate found")
@@ -3521,6 +7222,46 @@ def _build_findings_summary(reports_dir, only_report=None):
         ) or is_web_report
         if not recognized:
             unknown_reports.append(report_name)
+
+        # Parse only the single, exact schema block emitted by record_candidate.
+        # Its presence records a test observation; it never promotes report status.
+        structured_record = None
+        result_begin = "JARVIS STRUCTURED TEST RESULT BEGIN"
+        result_end = "JARVIS STRUCTURED TEST RESULT END"
+        result_begin_positions = [i for i, item in enumerate(lines) if item.strip() == result_begin]
+        result_end_positions = [i for i, item in enumerate(lines) if item.strip() == result_end]
+        if is_candidate and len(result_begin_positions) == 1 and len(result_end_positions) == 1:
+            begin = result_begin_positions[0]
+            end = result_end_positions[0]
+            expected_layout = (
+                end == begin + 2
+                and begin >= 3
+                and lines[begin - 3].strip() == "Validation limitations:"
+                and bool(lines[begin - 2].strip())
+                and not lines[begin - 1].strip()
+                and end + 2 < len(lines)
+                and lines[end + 1].strip() == ""
+                and lines[end + 2].strip() == "Potential impact (conditional; not demonstrated):"
+                and lines[begin + 1].startswith("Structured test result (JSON): ")
+            )
+            if expected_layout:
+                try:
+                    serialized_result = json.loads(
+                        lines[begin + 1].removeprefix("Structured test result (JSON): ")
+                    )
+                    normalized_result = _normalize_structured_test_result(serialized_result)
+                    if normalized_result == serialized_result:
+                        structured_record = normalized_result
+                except (TypeError, ValueError):
+                    structured_record = None
+        if structured_record is not None:
+            structured_test_observations.append((
+                report_name,
+                structured_record["test_type"],
+                structured_record["observation"],
+                structured_record["response_origin"],
+                structured_record["evidence_completeness"],
+            ))
 
         severity_begin = "JARVIS TRUSTED SEVERITY METADATA BEGIN"
         severity_end = "JARVIS TRUSTED SEVERITY METADATA END"
@@ -3585,7 +7326,7 @@ def _build_findings_summary(reports_dir, only_report=None):
                 title = "Potential security finding (title Unknown)"
             elif is_web_report:
                 title = "Web information report"
-        report_titles.append((report_name, title or "Unknown"))
+        report_titles.append((report_name, safe_summary_value(title or "Unknown")))
 
         section = None
         pending_input = None
@@ -3601,7 +7342,6 @@ def _build_findings_summary(reports_dir, only_report=None):
         report_has_context = is_php_flow and "Static source review only" in text
         has_explicit_input_status = False
         vulnerability_value = ""
-        validation_evidence = []
         in_validation = False
         severity_assessment = ""
         severity_rationale = ""
@@ -3619,7 +7359,7 @@ def _build_findings_summary(reports_dir, only_report=None):
                 if not stripped or stripped.endswith(":") or stripped.startswith(("Important:", "---")):
                     in_recommendation = False
                 else:
-                    remediation_guidance.append((report_name, stripped))
+                    remediation_guidance.append((report_name, safe_summary_value(stripped)))
                     in_recommendation = True
 
             if stripped.startswith("Vulnerability status:"):
@@ -3628,25 +7368,23 @@ def _build_findings_summary(reports_dir, only_report=None):
                 vulnerability_value = vulnerability_value
             elif stripped.startswith("Independent validation evidence:"):
                 in_validation = True
-                value = stripped.split(":", 1)[1].strip()
-                if value:
-                    validation_evidence.append(value)
                 continue
             elif in_validation:
                 if not stripped:
                     in_validation = False
-                elif not lower.startswith(("unknown", "none", "not provided", "n/a")):
-                    validation_evidence.append(stripped)
                 continue
 
             if line_index in trusted_severity_lines and stripped.startswith("Severity assessment:"):
                 severity_assessment = stripped.split(":", 1)[1].strip()
             elif line_index in trusted_severity_lines and stripped.startswith("Severity rationale:"):
                 severity_rationale = stripped.split(":", 1)[1].strip()
-            elif stripped.startswith("User-provided severity suggestion (unverified):"):
-                severity_suggestion = stripped.split(":", 1)[1].strip() or "Unknown"
+            elif stripped.startswith((
+                "User-provided severity suggestion (unverified):",
+                "Severity suggestion (unverified):",
+            )):
+                severity_suggestion = safe_summary_value(stripped.split(":", 1)[1]) or "Unknown"
             elif stripped.startswith("Potential severity:"):
-                severity_suggestion = stripped.split(":", 1)[1].strip() or "Unknown"
+                severity_suggestion = safe_summary_value(stripped.split(":", 1)[1]) or "Unknown"
             elif stripped.startswith("Evidence location:"):
                 explicit_evidence_location = stripped.split(":", 1)[1].strip()
                 loc_file, loc_line = source_location(explicit_evidence_location)
@@ -3661,9 +7399,10 @@ def _build_findings_summary(reports_dir, only_report=None):
                 analysis_statements.append((report_name, "Saved analysis reports no direct GET/POST/REQUEST input evidence; this is not a safety determination."))
             elif stripped in {"NO INPUT DETECTED", "INPUT DETECTED", "SOURCE FLOW DETECTED"} or stripped.startswith("ANALYSIS INCOMPLETE — "):
                 has_explicit_input_status = True
-                analysis_statements.append((report_name, f"Saved analysis status: {stripped}; this is not vulnerability confirmation."))
+                analysis_statements.append((report_name, safe_summary_value(f"Saved analysis status: {stripped}; this is not vulnerability confirmation.")))
 
             if stripped in {
+                "Form control observations:",
                 "Input evidence:",
                 "Unresolved conditional input evidence:",
                 "Request presence evidence:",
@@ -3672,15 +7411,27 @@ def _build_findings_summary(reports_dir, only_report=None):
                 "Included-file analysis:",
                 "Sink observations:",
                 "Source-flow evidence:",
+                "Local function analysis:",
+                "Database operation observations:",
+                "Output branch observations:",
                 "Unresolved analysis candidates:",
                 "Evidence details:",
                 "Evidence:",
                 "Query-flow evidence:",
                 "Data-flow verification:",
                 "XSS output flow:",
-            } or stripped.startswith("Evidence details ("):
+                "Security Headers:",
+                "Security Header Observations:",
+            } or stripped.startswith((
+                "Evidence details (", "Observed evidence (", "Unverified information ("
+            )):
                 section = stripped.rstrip(":")
-                if section.startswith("Evidence details") or (section == "Evidence" and is_finding):
+                if (
+                    section.startswith((
+                        "Evidence details", "Observed evidence", "Unverified information"
+                    ))
+                    or (section == "Evidence" and is_finding)
+                ):
                     in_evidence = True
                     evidence_lines = []
                 else:
@@ -3871,11 +7622,19 @@ def _build_findings_summary(reports_dir, only_report=None):
                 add_record("Legacy reported source-to-sink claim (unverified)", report_name, None, None, stripped)
                 report_has_evidence = True
 
-            if is_web_report and stripped.startswith("[MISSING]"):
+            if (
+                is_web_report
+                and section in {"Security Headers", "Security Header Observations"}
+                and stripped.startswith("[MISSING]")
+            ):
                 add_record("Observed web security-header pattern", report_name, None, None, stripped)
                 report_has_evidence = True
 
-            if is_web_report and re.match(r"(?:Content-Security-Policy|X-Content-Type-Options|X-Frame-Options|Strict-Transport-Security):\s*MISSING", stripped, re.I):
+            if (
+                is_web_report
+                and section in {"Security Headers", "Security Header Observations"}
+                and re.match(r"(?:Content-Security-Policy|X-Content-Type-Options|X-Frame-Options|Strict-Transport-Security):\s*MISSING", stripped, re.I)
+            ):
                 add_record("Observed web security-header pattern", report_name, None, None, stripped)
                 report_has_evidence = True
 
@@ -3967,7 +7726,7 @@ def _build_findings_summary(reports_dir, only_report=None):
                 evidence = explicit_evidence_location
             file_name, line_number = source_location(explicit_evidence_location or "")
             add_record(
-                "User-provided finding evidence" if is_finding else "User-provided candidate evidence",
+                "User-provided finding evidence" if is_finding else "Recorded candidate evidence",
                 report_name,
                 file_name,
                 line_number,
@@ -3976,56 +7735,18 @@ def _build_findings_summary(reports_dir, only_report=None):
             report_has_evidence = report_has_evidence or bool(evidence and not evidence.lower().startswith("unknown"))
             report_has_location = report_has_location or bool(file_name)
 
-        status_value = vulnerability_value.lower()
-        validation_text = " ".join(validation_evidence)
-        validation_is_negative = bool(re.search(
-            r"\b(?:not|no|never|unable|cannot|can't|couldn't|failed|inconclusive|pending|unknown|none|n/?a)\b",
-            validation_text,
-            re.I,
-        ))
-        validation_has_action = bool(re.search(
-            r"\b(?:retest|test(?:ed|ing)?|replay(?:ed)?|sent|submitted|request(?:ed)?|payload)\b",
-            validation_text,
-            re.I,
-        ))
-        validation_has_observed_result = bool(re.search(
-            r"\b(?:(?:observed|reproduced|demonstrated|returned|accessed|retrieved|executed|exploited|exposed)\s+(?:the\s+|a\s+|an\s+)?[\w'$\"-]+|[\w'$\"-]+\s+(?:observed|reproduced|demonstrated|returned|accessed|retrieved|executed|exploited|exposed)|resulted\s+in\s+(?:the\s+|a\s+|an\s+)?[\w'$\"-]+)\b",
-            validation_text,
-            re.I,
-        ))
-        validation_tokens = set(re.findall(r"[a-z0-9_$'-]+", validation_text.lower()))
-        validation_boilerplate = {
-            "authorized", "independent", "validation", "evidence", "expected",
-            "the", "a", "an", "and", "or", "was", "were", "is", "are",
-            "been", "being", "then", "before", "after", "it", "this", "that",
-            "these", "those", "recorded", "record", "verified", "confirmed",
-            "retest", "test", "testing", "tested", "replay", "replayed",
-            "sent", "submitted", "request", "requested", "payload", "observed",
-            "reproduced", "demonstrated", "returned", "accessed", "retrieved",
-            "executed", "exploited", "exposed", "resulted", "in",
-            "http", "https", "response", "status", "request",
-        }
-        validation_has_result_detail = bool(
-            validation_tokens - validation_boilerplate
-        )
-        validation_is_affirmative = (
-            validation_has_action
-            and validation_has_observed_result
-            and validation_has_result_detail
-        )
-        explicit_confirmed = bool(
-            is_finding
-            and
-            re.match(r"^confirmed(?:\b|[:;])", status_value)
-            and validation_evidence
-            and not any(is_placeholder_text(item) for item in validation_evidence)
-            and not validation_is_negative
-            and validation_is_affirmative
-        )
-        status = (
-            "CONFIRMED (as recorded) — not independently verified by this summary"
-            if explicit_confirmed else "UNCONFIRMED"
-        )
+        # Saved statuses and free-form narratives are claims in text. The current
+        # workflow records observations, but has no type-specific confirmation
+        # process that can establish exploitability or impact.
+        if re.match(r"^confirmed(?:\b|[:;])", vulnerability_value, re.I):
+            status = (
+                "UNCONFIRMED (saved status is a text claim; no current candidate-type workflow "
+                "can independently establish confirmation)"
+            )
+        elif structured_record is not None:
+            status = "UNCONFIRMED (structured test observation recorded; vulnerability not established)"
+        else:
+            status = "UNCONFIRMED"
         report_statuses.append((report_name, status))
 
         assessed = severity_assessment.strip()
@@ -4161,6 +7882,16 @@ def _build_findings_summary(reports_dir, only_report=None):
     else:
         output.append("  None recorded.")
 
+    output.extend(["", "Saved structured test records (report text; not independently authenticated):"])
+    if structured_test_observations:
+        output.extend(
+            f"  {name}: recorded fields claim {test_type}; observation={observation}; "
+            f"source={origin}; completeness={completeness_label}; not a vulnerability verdict"
+            for name, test_type, observation, origin, completeness_label in structured_test_observations
+        )
+    else:
+        output.append("  None recorded.")
+
     output.extend(["", "Report status:"])
     if report_statuses:
         output.extend(f"  {name}: {status}" for name, status in report_statuses)
@@ -4173,6 +7904,30 @@ def _build_findings_summary(reports_dir, only_report=None):
             output.append(f"  {name}: {severity_label}{suffix}")
     else:
         output.append("  None")
+    notes, malformed_validation_notes, validation_note_error = _read_review_notes(root)
+    latest_validation = {
+        report_name: _latest_validation_status(notes, report_name)
+        for report_name, _report_path in report_files
+    }
+    status_labels = (
+        "OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE",
+    )
+    output.extend([
+        "", "Reviewer validation status (sidecar record; reviewer-reported, not authenticated by JARVIS):"
+    ])
+    if validation_note_error:
+        output.append("  Counts: Unknown (review-note storage could not be read).")
+    else:
+        output.extend(
+            f"  {status}: {sum(value == status for value in latest_validation.values())}"
+            for status in status_labels
+        )
+        if malformed_validation_notes:
+            output.append(f"  Malformed review-note records skipped: {malformed_validation_notes}")
+    output.append(
+        "  These reviewer statuses do not alter each saved report's automated Vulnerability status."
+    )
+
     output.extend(["", "Evidence completeness:"])
     if completeness:
         output.extend(f"  {name}: {label}" for name, label in completeness)
@@ -4197,13 +7952,20 @@ def _build_findings_summary(reports_dir, only_report=None):
         "  Static relationships are review evidence. Missing locations, unsupported syntax, and runtime behavior remain unresolved.",
         "",
         "Recommended manual review:",
-        "  Open each source report with 'view <filename>', verify the cited source-to-sink path and impact in authorized context, and record any independent validation evidence separately.",
+        "  Open each source report with 'view <listed alias>', verify the cited source-to-sink path and impact in authorized context, and record any independent validation evidence separately.",
     ])
     return "\n".join(output)
 
 
 def show_findings_summary():
-    print(_build_findings_summary(REPORTS_DIR))
+    summary_text = _build_findings_summary(REPORTS_DIR)
+    print(_safe_report_output_text(summary_text, REPORTS_DIR))
+
+
+def _split_saved_report_lines(report_text):
+    """Split report structure only on LF; render other separators as text."""
+    normalized = str(report_text).replace("\r\n", "\n").replace("\r", r"\r")
+    return [_escape_report_header_value(line) for line in normalized.split("\n")]
 
 
 def _build_review_queue(reports_dir):
@@ -4336,7 +8098,7 @@ def _build_review_queue(reports_dir):
     ]
     if not queue_items:
         output.extend(["", "No saved reports available for review."])
-        return "\n".join(output)
+        return _safe_report_output_text("\n".join(output), root)
 
     for item in queue_items:
         output.extend([
@@ -4363,7 +8125,7 @@ def _build_review_queue(reports_dir):
         "Review priority never confirms a vulnerability or establishes exploitability.",
         "The queue reads saved reports only; it does not rerun scans or change report status or severity.",
     ])
-    return "\n".join(output)
+    return _safe_report_output_text("\n".join(output), root)
 
 
 def show_review_queue():
@@ -4423,7 +8185,7 @@ def _build_review_progress(reports_dir):
             "  Orphaned valid notes: Unknown",
             f"  Storage issue: {note_error}",
         ])
-        return "\n".join(output)
+        return _safe_report_output_text("\n".join(output), root)
 
     # Canonical JSON makes key ordering irrelevant while preserving distinctions
     # between records with different timestamps, conclusions, or evidence.
@@ -4475,7 +8237,7 @@ def _build_review_progress(reports_dir):
         f"  Orphaned valid notes (report no longer present): {orphan_count}",
         "  Reviewer conclusions do not change saved report vulnerability statuses.",
     ])
-    return "\n".join(output)
+    return _safe_report_output_text("\n".join(output), root)
 
 
 def show_review_progress():
@@ -4508,7 +8270,138 @@ def _reviewable_report_names(reports_dir):
     return names
 
 
-def _save_review_note(reports_dir, selection, conclusion, evidence, uncertainties):
+_VALIDATION_STATUSES = {
+    "OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE",
+}
+_VALIDATION_DETAIL_FIELDS = (
+    "endpoint", "category", "severity", "severity_justification", "preconditions",
+    "reproduction_steps", "expected_behavior", "actual_behavior", "evidence",
+    "impact", "limitations", "remediation",
+)
+_VALIDATION_TRANSITIONS = {
+    "OBSERVED": {"OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE"},
+    "UNVERIFIED": {"OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE"},
+    "VALIDATED": {"UNVERIFIED"},
+    "NOT_REPRODUCIBLE": {"UNVERIFIED"},
+    "FALSE_POSITIVE": {"UNVERIFIED"},
+}
+
+
+def _sanitize_reviewer_text(value):
+    """Redact common secrets and personal identifiers in reviewer-authored text."""
+    escaped = _escape_report_user_field(str(value).strip())
+    safe_lines = []
+    sensitive_header = re.compile(
+        r"(?i)^\s*[\"']?(?:authorization|proxy-authorization|cookie|set-cookie|"
+        r"x-[a-z0-9-]*(?:api[-_]?key|auth[-_]?key|token|secret|password|"
+        r"session[-_]?id))[\"']?\s*[:=]"
+    )
+    credential_assignment = re.compile(
+        r"(?i)([\"']?(?:authorization|proxy-authorization|cookie|set-cookie|"
+        r"x-[a-z0-9-]*(?:api[-_]?key|auth[-_]?key|token|secret|password|"
+        r"session[-_]?id))[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|(?:bearer|basic)\s+[^\s,;&}]+|[^\s,;&}]+)"
+    )
+    secret_assignment = re.compile(
+        r"(?i)(\b(?:password|passwd|token|access[-_]?token|auth[-_]?key|"
+        r"api[-_]?key|client[-_]?secret|secret|session[-_]?id)\b\s*[=:]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
+    )
+    email_address = re.compile(
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+    )
+    phone_number = re.compile(
+        r"(?<!\w)(?:\+?\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?)?\d{3}[ .-]?\d{4}(?!\w)"
+    )
+    for line in escaped.split(r"\n"):
+        if sensitive_header.match(line):
+            label = re.split(r"[:=]", line, maxsplit=1)[0]
+            line = label.strip(" '\"") + ": [REDACTED]"
+        else:
+            line = credential_assignment.sub(r"\1[REDACTED]", line)
+            line = secret_assignment.sub(r"\1[REDACTED]", line)
+        line = email_address.sub("[REDACTED_EMAIL]", line)
+        line = phone_number.sub("[REDACTED_PHONE]", line)
+        safe_lines.append(line)
+    return r"\n".join(safe_lines)
+
+
+def _normalize_validation_record(status, details, require_scope=True):
+    """Validate and safely render a structured, reviewer-authored validation record."""
+    if status not in _VALIDATION_STATUSES or not isinstance(details, dict):
+        raise ValueError("Choose a supported validation status and provide structured details.")
+    if not all(
+        isinstance(details.get(field), str) and details[field].strip()
+        for field in _VALIDATION_DETAIL_FIELDS
+    ):
+        raise ValueError("All validation record fields are required; enter Unknown when unavailable.")
+
+    raw = {field: details[field].strip() for field in _VALIDATION_DETAIL_FIELDS}
+    if require_scope and not check_scope(raw["endpoint"], announce=False):
+        raise ValueError("Validation endpoint must be inside the current authorized scope.")
+    try:
+        endpoint_parts = urlsplit(raw["endpoint"])
+        if endpoint_parts.scheme.lower() not in {"http", "https"} or not endpoint_parts.netloc:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Validation endpoint must be an absolute HTTP or HTTPS URL.")
+
+    safe = {field: _sanitize_reviewer_text(value) for field, value in raw.items()}
+    safe["endpoint"] = _render_report_endpoint(raw["endpoint"])
+    if safe["endpoint"] == "<unavailable endpoint>":
+        raise ValueError("Validation endpoint could not be rendered safely.")
+
+    placeholders = {"", "unknown", "n/a", "not provided", "none"}
+    required_by_status = {
+        "OBSERVED": ("actual_behavior", "evidence"),
+        "UNVERIFIED": ("evidence", "limitations"),
+        "VALIDATED": (
+            "category", "severity_justification", "preconditions", "reproduction_steps",
+            "expected_behavior", "actual_behavior", "evidence", "impact", "limitations",
+            "remediation",
+        ),
+        "NOT_REPRODUCIBLE": (
+            "preconditions", "reproduction_steps", "expected_behavior", "actual_behavior",
+            "evidence", "limitations",
+        ),
+        "FALSE_POSITIVE": ("category", "actual_behavior", "evidence", "limitations"),
+    }
+    for field in required_by_status[status]:
+        if " ".join(raw[field].split()).casefold().strip(" .") in placeholders:
+            raise ValueError(f"{field.replace('_', ' ').capitalize()} is required for {status}.")
+
+    if status in {"VALIDATED", "NOT_REPRODUCIBLE"}:
+        steps = [
+            line.strip()
+            for line in re.split(r"\r\n|\n|\\n", raw["reproduction_steps"])
+            if line.strip()
+        ]
+        numbered_steps = re.findall(
+            r"(?m)^\s*\d+[.)]\s+|(?:;\s*)\d+[.)]\s+",
+            raw["reproduction_steps"],
+        )
+        if max(len(steps), len(numbered_steps)) < 2:
+            raise ValueError("Record at least two reproducible steps for this status.")
+    if status == "VALIDATED":
+        if raw["expected_behavior"].strip().casefold() == raw["actual_behavior"].strip().casefold():
+            raise ValueError("VALIDATED requires distinct expected and actual behavior.")
+        if raw["severity"].strip().casefold() in placeholders:
+            raise ValueError("Record a reviewer severity or explicitly enter Not assessed.")
+    return safe
+
+
+def _latest_validation_status(notes, report_name):
+    status = "UNVERIFIED"
+    for note in notes:
+        if note.get("report_filename") == report_name and note.get("validation_status") in _VALIDATION_STATUSES:
+            status = note["validation_status"]
+    return status
+
+
+def _save_review_note(
+    reports_dir, selection, conclusion, evidence, uncertainties,
+    validation_status=None, validation_details=None,
+):
     """Append a reviewer-authored note without modifying its source report."""
     root = Path(reports_dir)
     if not isinstance(selection, str) or not selection.strip():
@@ -4550,6 +8443,22 @@ def _save_review_note(reports_dir, selection, conclusion, evidence, uncertaintie
         "supporting_evidence": evidence.strip(),
         "remaining_uncertainties": uncertainties.strip(),
     }
+    note["supporting_evidence"] = _sanitize_reviewer_text(note["supporting_evidence"])
+    note["remaining_uncertainties"] = _sanitize_reviewer_text(note["remaining_uncertainties"])
+
+    if validation_status is not None:
+        validation_record = _normalize_validation_record(validation_status, validation_details)
+        existing_notes, _malformed, note_error = _read_review_notes(root)
+        if note_error:
+            raise OSError("Cannot determine the prior validation status from review-note storage.")
+        previous_status = _latest_validation_status(existing_notes, report_name)
+        if validation_status not in _VALIDATION_TRANSITIONS.get(previous_status, set()):
+            raise ValueError(
+                f"Invalid validation status transition: {previous_status} -> {validation_status}. "
+                "Reopen a completed assessment as UNVERIFIED before recording a new outcome."
+            )
+        note["validation_status"] = validation_status
+        note["validation_details"] = validation_record
 
     try:
         resolved_root = root.resolve(strict=True)
@@ -4608,6 +8517,60 @@ def review_note_workflow(reports_dir):
     print(f"JARVIS: Note recorded for {note['report_filename']} at {note['reviewed_at']}.")
 
 
+def validation_note_workflow(reports_dir):
+    """Record a structured, reviewer-authored outcome without editing a report."""
+    report_names = _reviewable_report_names(reports_dir)
+    print("JARVIS STRUCTURED VALIDATION NOTE")
+    print("==================================")
+    print("This records reviewer input only; it sends no requests and changes no saved report.")
+    if not report_names:
+        print("JARVIS: No saved .txt reports are available for validation notes.")
+        return
+    for index, name in enumerate(report_names, start=1):
+        safe_name = _safe_report_output_text(name, reports_dir)
+        print(f"  {index}. {safe_name}")
+    print("Status options: OBSERVED, UNVERIFIED, VALIDATED, NOT_REPRODUCIBLE, FALSE_POSITIVE")
+    try:
+        selection = input("Select report by number: ").strip()
+        status = input("Reviewer status: ").strip().upper()
+        if status not in _VALIDATION_STATUSES:
+            raise ValueError("Choose one of the listed validation statuses.")
+        print("Enter Unknown for unavailable details; VALIDATED requires complete reproducible evidence.")
+        details = {}
+        for field in _VALIDATION_DETAIL_FIELDS:
+            prompt = field.replace("_", " ").capitalize()
+            details[field] = input(f"{prompt}: ")
+        evidence = details["evidence"]
+        uncertainties = details["limitations"]
+        conclusion = {
+            "VALIDATED": "Verified in authorized lab",
+            "NOT_REPRODUCIBLE": "Not reproduced",
+        }.get(status, "Needs more evidence")
+        note = _save_review_note(
+            reports_dir,
+            selection,
+            conclusion,
+            evidence,
+            uncertainties,
+            validation_status=status,
+            validation_details=details,
+        )
+    except EOFError:
+        print("JARVIS: Validation-note input ended early; no note was saved.")
+        return
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"JARVIS: Validation note was not saved: {error}")
+        return
+    print(
+        "JARVIS: Reviewer validation record appended. "
+        "It does not change the saved report's automated status or severity."
+    )
+    print(
+        f"JARVIS: {_escape_report_user_field(note['validation_status'])} "
+        f"record recorded for {_escape_report_user_field(note['report_filename'])}."
+    )
+
+
 def _is_safe_review_note_filename(filename):
     return (
         isinstance(filename, str)
@@ -4657,6 +8620,8 @@ def _read_review_notes(reports_dir):
         "Needs more evidence", "Not reproduced", "Verified in authorized lab",
     }
     notes = []
+    latest_status_by_report = {}
+    seen_validation_records = set()
     malformed = 0
     for line in text.splitlines():
         if not line.strip():
@@ -4676,6 +8641,29 @@ def _read_review_notes(reports_dir):
             parsed_timestamp = datetime.fromisoformat(note["reviewed_at"])
             if parsed_timestamp.utcoffset() is None:
                 raise ValueError("review timestamp is not timezone-aware")
+            has_status = "validation_status" in note
+            has_details = "validation_details" in note
+            if has_status != has_details:
+                raise ValueError("incomplete validation record")
+            if has_status:
+                normalized_details = _normalize_validation_record(
+                    note["validation_status"],
+                    note["validation_details"],
+                    require_scope=False,
+                )
+                if normalized_details != note["validation_details"]:
+                    raise ValueError("validation record is not safely normalized")
+                note_identity = json.dumps(
+                    note, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                if note_identity not in seen_validation_records:
+                    previous_status = latest_status_by_report.get(
+                        note["report_filename"], "UNVERIFIED"
+                    )
+                    if note["validation_status"] not in _VALIDATION_TRANSITIONS.get(previous_status, set()):
+                        raise ValueError("invalid validation status transition")
+                    latest_status_by_report[note["report_filename"]] = note["validation_status"]
+                    seen_validation_records.add(note_identity)
         except (json.JSONDecodeError, TypeError, ValueError):
             malformed += 1
             continue
@@ -4700,14 +8688,15 @@ def review_notes_workflow(reports_dir):
     report_names = set(_reviewable_report_names(reports_dir))
     print("Saved notes:")
     for index, note in enumerate(notes, start=1):
-        evidence_summary = " ".join(note["supporting_evidence"].split())
+        evidence_summary = _sanitize_reviewer_text(note["supporting_evidence"])
+        evidence_summary = " ".join(evidence_summary.split())
         if len(evidence_summary) > 120:
             evidence_summary = evidence_summary[:117] + "..."
         orphaned_label = (
             " | ORPHANED: referenced report is missing"
             if note["report_filename"] not in report_names else ""
         )
-        print(f"  {index}. {note['report_filename']} | {note['reviewed_at']} | "
+        print(f"  {index}. {_escape_report_user_field(note['report_filename'])} | {note['reviewed_at']} | "
               f"Reviewer-provided conclusion (not independently verified by JARVIS): "
               f"{note['reviewer_conclusion']}{orphaned_label}")
         print(f"     Evidence summary: {evidence_summary}")
@@ -4728,21 +8717,31 @@ def review_notes_workflow(reports_dir):
         return
     for index, note in enumerate(selected_notes, start=1):
         print("")
-        print(f"Review note {index} for {note['report_filename']}")
+        print(f"Review note {index} for {_escape_report_user_field(note['report_filename'])}")
         if note["report_filename"] not in report_names:
             print("Report availability: ORPHANED; referenced report is missing.")
         print(f"Reviewed at: {note['reviewed_at']}")
         print("Reviewer-provided conclusion (not independently verified by JARVIS): "
               f"{note['reviewer_conclusion']}")
-        print(f"Supporting evidence: {note['supporting_evidence']}")
-        print(f"Remaining uncertainties: {note['remaining_uncertainties']}")
+        print(f"Supporting evidence: {_sanitize_reviewer_text(note['supporting_evidence'])}")
+        print(f"Remaining uncertainties: {_sanitize_reviewer_text(note['remaining_uncertainties'])}")
+        if note.get("validation_status"):
+            print(
+                "Manual validation status (reviewer-reported; not authenticated by JARVIS): "
+                f"{note['validation_status']}"
+            )
+            for field in _VALIDATION_DETAIL_FIELDS:
+                print(
+                    f"  {field.replace('_', ' ').title()}: "
+                    f"{_sanitize_reviewer_text(note['validation_details'][field])}"
+                )
     print("Automated report content and vulnerability status were not read or changed.")
 
 
-def _report_display_entries():
+def _report_display_entries(reports_dir=None):
     """Return stable, safe aliases for report files contained in REPORTS_DIR."""
     global _REPORT_DISPLAY_ALIASES
-    reports_directory = REPORTS_DIR
+    reports_directory = Path(reports_dir) if reports_dir is not None else Path(REPORTS_DIR)
     try:
         resolved_root = reports_directory.resolve()
     except OSError:
@@ -4801,6 +8800,23 @@ def _safe_report_display_text(report_text):
     return "\n".join(f"  | {line}" for line in rendered)
 
 
+def _safe_report_output_text(output_text, reports_dir=None):
+    """Render summary and review output with safe aliases and field escaping."""
+    aliases = {}
+    for alias, _report_path in _report_display_entries(reports_dir):
+        report_name = _REPORT_DISPLAY_ALIASES.get(alias)
+        if report_name:
+            aliases[report_name] = alias
+    output_text = str(output_text)
+    if aliases:
+        names = sorted(aliases, key=len, reverse=True)
+        pattern = re.compile("|".join(re.escape(name) for name in names))
+        output_text = pattern.sub(lambda match: aliases[match.group(0)], output_text)
+    return "\n".join(
+        _escape_report_user_field(line) for line in output_text.split("\n")
+    )
+
+
 def list_reports():
     REPORTS_DIR.mkdir(exist_ok=True)
     entries = _report_display_entries()
@@ -4847,7 +8863,19 @@ def view_report(filename):
 
 
 def _report_remediation(finding_type, description=""):
-    kind = f"{finding_type} {description}".lower()
+    finding_kind = str(finding_type).lower()
+    description_kind = str(description).lower()
+    kind = f"{finding_kind} {description_kind}"
+    if "sql" in finding_kind:
+        return "If query construction from untrusted input is confirmed, use parameterized queries and validate input according to its expected type. Verify the relevant code path first."
+    if any(term in finding_kind for term in ("xss", "reflect", "output")):
+        return "If untrusted data is confirmed to reach this rendering context, apply context-appropriate output encoding. Confirm the rendered context before selecting an encoding strategy."
+    if any(term in finding_kind for term in ("access", "authorization", "idor")):
+        return "If an authorization gap is confirmed, enforce server-side authorization for each requested object or action and verify controls with an authorized test account."
+    if "header" in finding_kind:
+        return "If the header behavior is confirmed to be unintended, configure it according to the application's requirements and deployment needs."
+
+    # Fall back to the description only when the finding type is generic.
     if "sql" in kind:
         return "If query construction from untrusted input is confirmed, use parameterized queries and validate input according to its expected type. Verify the relevant code path first."
     if "xss" in kind or "reflect" in kind or "output" in kind:
@@ -4857,6 +8885,91 @@ def _report_remediation(finding_type, description=""):
     if "header" in kind:
         return "If the header behavior is confirmed to be unintended, configure it according to the application's requirements and deployment needs."
     return "Review the cited input, processing, and output path. Apply a control appropriate to verified behavior, then retest locally or within authorized scope."
+
+
+def _candidate_report_title_and_impact(finding_type):
+    """Use controlled titles and conditional impact text for known candidate classes."""
+    known_candidates = {
+        "reflected input": (
+            "Potential reflected-input candidate (unverified)",
+            "If untrusted data is confirmed to reach a browser-interpreted context, it could affect page behavior. Browser execution and impact were not tested.",
+        ),
+        "sql injection": (
+            "Potential SQL injection candidate (unverified)",
+            "If untrusted input is confirmed to alter a database query, it could change query behavior or data access. Query execution and impact were not verified.",
+        ),
+        "high-risk input": (
+            "Potential high-risk input candidate (unverified)",
+            "A parameter-name match alone does not demonstrate impact. Consequences depend on how the input is used and must be independently verified.",
+        ),
+        "broken access control": (
+            "Potential access-control candidate (unverified)",
+            "If an authorization gap is confirmed, an unauthorized user could access an object or action. No access-control failure was demonstrated.",
+        ),
+    }
+    return known_candidates.get(
+        str(finding_type).strip().casefold(),
+        (
+            "Unverified security candidate",
+            "Potential impact is unknown until the behavior and affected assets are independently verified.",
+        ),
+    )
+
+
+def _normalize_structured_test_result(result):
+    """Accept only the small, controlled test-observation schema JARVIS emits."""
+    if not isinstance(result, dict) or set(result) != {
+        "schema_version", "method", "test_type", "observation",
+        "requested_endpoint", "final_response_endpoint", "response_origin",
+        "evidence_completeness", "not_established",
+    }:
+        return None
+    if type(result.get("schema_version")) is not int or result.get("schema_version") != 1:
+        return None
+    if result.get("method") != "scoped_get":
+        return None
+    if result.get("test_type") != "harmless_reflection_marker":
+        return None
+    observation = result.get("observation")
+    if not isinstance(observation, str) or observation not in {"marker_reflected", "marker_not_reflected"}:
+        return None
+    response_origin = result.get("response_origin")
+    if not isinstance(response_origin, str) or response_origin not in {"fresh", "cached", "unknown"}:
+        return None
+    evidence_completeness = result.get("evidence_completeness")
+    if not isinstance(evidence_completeness, str) or evidence_completeness not in {"complete", "incomplete", "inconclusive"}:
+        return None
+    not_established = result.get("not_established")
+    if (
+        not isinstance(not_established, list)
+        or not not_established
+        or any(
+            not isinstance(item, str)
+            or item not in {"browser_execution", "exploitability", "impact"}
+            for item in not_established
+        )
+    ):
+        return None
+    requested_endpoint = result.get("requested_endpoint")
+    final_endpoint = result.get("final_response_endpoint")
+    if not isinstance(requested_endpoint, str) or not requested_endpoint.strip():
+        return None
+    if not isinstance(final_endpoint, str) or not final_endpoint.strip():
+        return None
+    if observation == "marker_not_reflected" and evidence_completeness != "complete":
+        return None
+
+    return {
+        "schema_version": 1,
+        "method": "scoped_get",
+        "test_type": "harmless_reflection_marker",
+        "observation": observation,
+        "requested_endpoint": _render_report_endpoint(requested_endpoint),
+        "final_response_endpoint": _render_report_endpoint(final_endpoint),
+        "response_origin": response_origin,
+        "evidence_completeness": evidence_completeness,
+        "not_established": sorted(set(not_established)),
+    }
 
 
 def _report_evidence_location(evidence):
@@ -4955,6 +9068,7 @@ It is NOT a confirmed vulnerability.
 Verify the issue and its impact before submitting any report.
 """
 
+    finding = _redact_potential_secrets(finding)
     finding_file.write_text(finding)
 
     print("JARVIS: Potential finding recorded.")
@@ -4966,6 +9080,12 @@ def record_candidate(
     observation_confidence="Heuristic candidate; underlying behavior is unverified",
     testing_context="Unknown; no testing context was provided.",
     remediation=None,
+    observed_evidence=None,
+    evidence_source=None,
+    evidence_endpoint=None,
+    scanner_interpretation=None,
+    validation_limitations=None,
+    structured_test_result=None,
 ):
 
     if not check_scope(target):
@@ -4985,31 +9105,79 @@ def record_candidate(
     supplied_context = _escape_report_user_field(str(testing_context).strip()) if testing_context and str(testing_context).strip() else "Unknown; no testing context was provided."
     remediation = _escape_report_user_field(str(remediation).strip()) if remediation and str(remediation).strip() else "Review the relevant behavior and choose a control only after the issue is verified."
     reported_target = _render_report_target(target)
+    report_title, potential_impact = _candidate_report_title_and_impact(finding_type)
     evidence_location = _escape_report_user_field(evidence_location)
+    if observed_evidence is None:
+        evidence_section = (
+            "Observed evidence:\n"
+            "Unknown; no source-tagged direct observation was provided.\n\n"
+            "Unverified information (caller-provided; not independently verified):\n"
+            f"{supplied_evidence}"
+        )
+    else:
+        observed_value = (
+            _escape_report_user_field(str(observed_evidence).strip())
+            if observed_evidence and str(observed_evidence).strip()
+            else "Unknown; no observed evidence was provided."
+        )
+        source_value = (
+            _escape_report_user_field(str(evidence_source).strip())
+            if evidence_source and str(evidence_source).strip()
+            else "Unknown; evidence source was not recorded."
+        )
+        endpoint_value = (
+            _render_report_endpoint(evidence_endpoint)
+            if evidence_endpoint
+            else "Unknown; no endpoint was recorded."
+        )
+        evidence_section = (
+            "Observed evidence (recorded observation; not independent validation):\n"
+            f"Source: {source_value}\n"
+            f"Endpoint: {endpoint_value}\n"
+            f"{observed_value}"
+        )
+    scanner_interpretation = (
+        _escape_report_user_field(str(scanner_interpretation).strip())
+        if scanner_interpretation and str(scanner_interpretation).strip()
+        else "Unknown; no scanner interpretation was recorded."
+    )
+    validation_limitations = (
+        _escape_report_user_field(str(validation_limitations).strip())
+        if validation_limitations and str(validation_limitations).strip()
+        else "The candidate has not been independently validated; exploitability and impact remain unknown."
+    )
+    normalized_test_result = _normalize_structured_test_result(structured_test_result)
+    structured_test_result_section = ""
+    if normalized_test_result is not None:
+        structured_test_result_section = (
+            "JARVIS STRUCTURED TEST RESULT BEGIN\n"
+            "Structured test result (JSON): "
+            + json.dumps(normalized_test_result, sort_keys=True, ensure_ascii=True)
+            + "\nJARVIS STRUCTURED TEST RESULT END\n\n"
+        )
 
     report = f"""[+] Vulnerability candidate found
-Type: User-provided category (unverified)
-Title: Unverified security candidate
-User-provided type (unverified): {supplied_type}
+Type: Candidate category (unverified)
+Title: {report_title}
+Candidate type (unverified): {supplied_type}
 Target: {reported_target}
 Observation confidence: Not independently assessed.
-User-provided confidence text (unverified): {supplied_confidence}
+Confidence note (unverified): {supplied_confidence}
 Vulnerability status: UNCONFIRMED; no independent validation evidence is recorded.
 JARVIS TRUSTED SEVERITY METADATA BEGIN
 Severity assessment: Not assessed
 Severity rationale: Available evidence does not establish exploitability or impact; the supplied suggestion is not adopted as a JARVIS assessment.
 JARVIS TRUSTED SEVERITY METADATA END
 Severity: Not assessed
-User-provided severity suggestion (unverified): {supplied_severity}
+Severity suggestion (unverified): {supplied_severity}
 Potential bounty: Check program policy
 Evidence: recorded below; not independently verified
 Status: Requires manual verification
 
-Description (user-provided; unverified):
+Candidate description (unverified):
 {supplied_description}
 
-Evidence details (user-provided; not independently verified):
-{supplied_evidence}
+{evidence_section}
 
 Evidence location:
 {evidence_location}
@@ -5017,7 +9185,19 @@ Evidence location:
 Evidence and confidence limitations:
 JARVIS has not independently validated the supplied material. Missing details are marked Unknown.
 
+Scanner interpretation (not directly observed):
+{scanner_interpretation}
+
+Validation limitations:
+{validation_limitations}
+
+{structured_test_result_section}Potential impact (conditional; not demonstrated):
+{potential_impact}
+
 Testing context:
+{supplied_context}
+
+Reproduction notes (recorded testing context only; no additional steps inferred):
 {supplied_context}
 
 Remediation:
@@ -5030,6 +9210,7 @@ Important: This is an unverified candidate, not a confirmed vulnerability.
 Only submit findings that are within the program's authorized scope and rules.
 """
 
+    report = _redact_potential_secrets(report)
     candidate_number = 1
     while True:
         suffix = "" if candidate_number == 1 else f"_{candidate_number}"
@@ -5044,6 +9225,7 @@ Only submit findings that are within the program's authorized scope and rules.
     print(report, end="")
     print(f"JARVIS: Candidate report saved to {finding_file.name}")
 def check_bWAPP_session():
+    response = None
     try:
         response = scoped_get(
             "http://127.0.0.1/bWAPP/",
@@ -5058,8 +9240,14 @@ def check_bWAPP_session():
         return False
 
     except requests.RequestException as e:
-        print(f"JARVIS: Could not check bWAPP session: {e}")
+        print(
+            "JARVIS: Could not check bWAPP session "
+            f"({type(e).__name__})."
+        )
         return False
+    finally:
+        if response is not None:
+            response.close()
 def set_session_cookie(cookie):
     cookie = cookie.strip()
 
@@ -5073,7 +9261,7 @@ def set_session_cookie(cookie):
         name.strip(),
         value.strip(),
         domain="127.0.0.1",
-        path="/"
+        path="/bWAPP/"
     )
 
     print(f"JARVIS: Session cookie '{name.strip()}' loaded.")
@@ -5122,11 +9310,17 @@ JARVIS: Available commands:
   review-note
       Record a reviewer note separately from a saved report.
 
+  validation-note
+      Record a structured manual status and evidence without editing the report.
+
   review-notes
       Read and inspect saved reviewer notes without changing any files.
 
   review-progress
       Summarize saved-report review coverage without changing files.
+
+  hackerone-review
+      Print the draft manual policy checklist; this does not authorize testing.
 
   view <filename>
       Display a saved report.
@@ -5138,6 +9332,9 @@ JARVIS: Available commands:
 
   php-scan <directory>
       Scan PHP files for GET/POST/REQUEST inputs.
+
+  js-flow <file.js|file.mjs|file.cjs>
+      Analyze a local JavaScript file as text; this command makes no requests.
 
   help
       Show this help message.
@@ -5300,6 +9497,12 @@ while True:
         else:
             analyze_php_flow(parts[1])
 
+    elif action == "js-flow":
+        if len(parts) < 2:
+            print("JARVIS: Usage: js-flow <file.js|file.mjs|file.cjs>")
+        else:
+            analyze_js_flow(parts[1])
+
     elif action == "php-scan":
         if len(parts) < 2:
             print("JARVIS: Usage: php-scan <directory>")
@@ -5329,12 +9532,17 @@ while True:
     elif action == "review-note":
 
         review_note_workflow(REPORTS_DIR)
+    elif action == "validation-note":
+
+        validation_note_workflow(REPORTS_DIR)
     elif action == "review-notes":
 
         review_notes_workflow(REPORTS_DIR)
     elif action == "review-progress":
 
         show_review_progress()
+    elif action == "hackerone-review":
+        hackerone_policy_review_checklist()
     elif action == "view":
         if len(parts) < 2:
             print("JARVIS: Usage: view <filename>")
