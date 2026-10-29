@@ -1734,6 +1734,291 @@ def check_sqli(url, parameter, enabled=False, budget_state=None):
 
     return found
 
+
+
+# ---------------------------------------------------------------------------
+# JavaScript file discovery and secret scanning (passive)
+# ---------------------------------------------------------------------------
+
+# Secret patterns with (regex, label, severity)
+_JS_SECRET_PATTERNS = [
+    # AWS
+    (r'AKIA[0-9A-Z]{16}',                                                          "AWS Access Key ID",        "High"),
+    (r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',               "AWS Secret Key",           "High"),
+    # Google
+    (r'AIza[0-9A-Za-z\-_]{35}',                                                    "Google API Key",           "High"),
+    (r'(?i)google.{0,20}["\']([A-Za-z0-9_\-]{24,})["\']',                         "Google Credential",        "Medium"),
+    # Generic API keys / tokens
+    (r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})["\']',       "API Key",                  "High"),
+    (r'(?i)(access[_-]?token|auth[_-]?token)\s*[:=]\s*["\']([A-Za-z0-9._\-]{20,})["\']', "Access Token",     "High"),
+    (r'(?i)(client[_-]?secret)\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})["\']',        "OAuth Client Secret",      "High"),
+    (r'(?i)(bearer\s+[A-Za-z0-9\-_.]{20,})',                                       "Bearer Token",             "High"),
+    # Private keys
+    (r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',                      "Private Key",              "Critical"),
+    # Passwords
+    (r'(?i)(password|passwd|pwd)\s*[:=]\s*["\']([^"\']{6,})["\']',               "Hardcoded Password",       "High"),
+    # Stripe
+    (r'sk_live_[0-9a-zA-Z]{24,}',                                                  "Stripe Live Secret Key",   "Critical"),
+    (r'rk_live_[0-9a-zA-Z]{24,}',                                                  "Stripe Restricted Key",    "Critical"),
+    # GitHub
+    (r'ghp_[A-Za-z0-9]{36}',                                                       "GitHub Personal Token",    "High"),
+    (r'github_pat_[A-Za-z0-9_]{82}',                                               "GitHub Fine-Grained Token","High"),
+    # Slack
+    (r'xox[baprs]-[A-Za-z0-9\-]{10,}',                                            "Slack Token",              "High"),
+    # Twilio
+    (r'SK[0-9a-fA-F]{32}',                                                         "Twilio API Key",           "High"),
+    # SendGrid
+    (r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}',                              "SendGrid API Key",         "High"),
+    # Database connection strings
+    (r'(?i)(mongodb|postgres|mysql|mssql|redis):\/\/[^\s"\'<>]{8,}',              "Database Connection String","High"),
+    # JWT secrets / tokens
+    (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}',       "JWT Token",                "Medium"),
+    # Internal endpoints / debug info
+    (r'(?i)(internal[_-]?api|debug[_-]?key|admin[_-]?token)\s*[:=]\s*["\']([^"\']{8,})["\']', "Internal Credential", "High"),
+]
+
+# Endpoint patterns to extract from JS for further testing
+_JS_ENDPOINT_PATTERNS = [
+    r'(?:fetch|axios\.(?:get|post|put|delete|patch)|http\.(?:get|post))\s*\(\s*["\']([/][^"\'<>\s]{3,})["\']',
+    r'(?:url|endpoint|path|api[Uu]rl|baseUrl|BASE_URL)\s*[=:]\s*["\']([/][a-zA-Z0-9_/\-\.?=&]{4,})["\']',
+    r'"((?:/api|/v\d|/rest|/graphql|/admin|/internal|/private)[a-zA-Z0-9_/\-\.?=&]*)"',
+    r"'((?:/api|/v\d|/rest|/graphql|/admin|/internal|/private)[a-zA-Z0-9_/\-\.?=&]*)'",
+]
+
+# Known safe / false-positive values to skip
+_JS_FALSE_POSITIVE_VALUES = {
+    "your-api-key-here", "your_api_key", "api_key_here",
+    "xxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "insert-your-key", "placeholder", "example", "changeme",
+    "enter-key-here", "your-token-here", "dummy", "test",
+    "abcdefghijklmnop", "1234567890abcdef",
+}
+
+
+def _find_script_urls(response):
+    """Extract all <script src="..."> URLs from a page."""
+    text  = response.text
+    lower = text.lower()
+    base  = response.url
+    urls  = []
+    seen  = set()
+    pos   = 0
+
+    while True:
+        tag_start = lower.find("<script", pos)
+        if tag_start == -1:
+            break
+        tag_end = lower.find(">", tag_start)
+        if tag_end == -1:
+            break
+        tag   = text[tag_start:tag_end + 1]
+        lower_tag = tag.lower()
+        src_idx = lower_tag.find("src=")
+        if src_idx != -1:
+            q = tag[src_idx + 4]
+            if q in ('"', "'"):
+                vs = src_idx + 5
+                ve = tag.find(q, vs)
+                if ve != -1:
+                    src = tag[vs:ve].strip()
+                    if src and src not in seen and not src.startswith("data:"):
+                        seen.add(src)
+                        full = urljoin(base, src)
+                        urls.append(full)
+        pos = tag_end + 1
+
+    return urls
+
+
+def _scan_js_content(js_text, source_url):
+    """
+    Scan JS text for secrets and endpoints.
+    Returns dict with 'secrets' and 'endpoints' lists.
+    """
+    secrets   = []
+    endpoints = []
+    seen_secrets   = set()
+    seen_endpoints = set()
+
+    for pattern, label, severity in _JS_SECRET_PATTERNS:
+        for m in re.finditer(pattern, js_text):
+            match_text = m.group(0)
+
+            # Skip known false positives
+            match_lower = match_text.lower()
+            if any(fp in match_lower for fp in _JS_FALSE_POSITIVE_VALUES):
+                continue
+
+            # Deduplicate
+            key = (label, match_text[:40])
+            if key in seen_secrets:
+                continue
+            seen_secrets.add(key)
+
+            # Redact middle of match for safe display
+            if len(match_text) > 16:
+                display = match_text[:8] + "..." + match_text[-4:]
+            else:
+                display = match_text[:4] + "..."
+
+            secrets.append({
+                "label":    label,
+                "severity": severity,
+                "display":  display,
+                "raw":      match_text[:120],
+                "source":   source_url,
+            })
+
+    for pattern in _JS_ENDPOINT_PATTERNS:
+        for m in re.finditer(pattern, js_text):
+            ep = m.group(1)
+            if ep in seen_endpoints:
+                continue
+            seen_endpoints.add(ep)
+            endpoints.append({"path": ep, "source": source_url})
+
+    return {"secrets": secrets, "endpoints": endpoints}
+
+
+def audit_js_files(response, budget_state=None):
+    """
+    Find all JS files linked from `response`, fetch them, and scan for
+    secrets and internal endpoints.
+
+    Passive — runs every audit (no active probing).
+    Returns dict with 'secrets' and 'endpoints' lists.
+    """
+    script_urls   = _find_script_urls(response)
+    all_secrets   = []
+    all_endpoints = []
+
+    print(f"JavaScript Files: {len(script_urls)} found")
+
+    if not script_urls:
+        return {"secrets": [], "endpoints": []}
+
+    for js_url in script_urls:
+        # Budget check
+        if budget_state is not None:
+            if budget_state.get("exhausted") or budget_state["used"] >= budget_state["limit"]:
+                budget_state["exhausted"] = True
+                print("  [STOPPED] Budget exhausted during JS scan.")
+                break
+
+        print(f"  Scanning: {js_url}")
+
+        try:
+            # Rate limiting
+            if budget_state is not None and budget_state.get("last_request_at"):
+                elapsed = time.monotonic() - budget_state["last_request_at"]
+                interval = budget_state.get("minimum_interval", 0.25)
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+            resp = scoped_get(
+                js_url,
+                timeout=10,
+                allow_redirects=True,
+                headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+            )
+
+            if budget_state is not None:
+                budget_state["used"] = budget_state.get("used", 0) + 1
+                budget_state["last_request_at"] = time.monotonic()
+
+            try:
+                results = _scan_js_content(resp.text, js_url)
+                all_secrets.extend(results["secrets"])
+                all_endpoints.extend(results["endpoints"])
+
+                if results["secrets"]:
+                    for s in results["secrets"]:
+                        print(f"    [{s['severity']}] {s['label']}: {s['display']}")
+                        record_candidate(
+                            response.url,
+                            f"Secret in JavaScript: {s['label']}",
+                            s["severity"],
+                            (
+                                f"A potential {s['label']} was found in a JavaScript file "
+                                f"accessible from the target."
+                            ),
+                            (
+                                f"Secret type: {s['label']}\n"
+                                f"JavaScript file: {js_url}\n"
+                                f"Match (truncated): {s['raw']}\n"
+                                "Secrets in publicly accessible JavaScript files can "
+                                "allow attackers to access APIs, databases, or cloud "
+                                "infrastructure directly."
+                            ),
+                            observation_confidence=(
+                                "Heuristic candidate: pattern match in JS source"
+                            ),
+                            testing_context=(
+                                f"Passive JS scan; GET request to {js_url}; "
+                                "regex pattern matched against response body."
+                            ),
+                            observed_evidence=(
+                                f"Pattern: {s['label']}\n"
+                                f"Match (truncated): {s['raw']}\n"
+                                f"Source file: {js_url}"
+                            ),
+                            evidence_source="JARVIS passive JS secret scan",
+                            evidence_endpoint=js_url,
+                            scanner_interpretation=(
+                                f"A {s['label']} pattern was matched in the JavaScript "
+                                "source. Verify the value is real and not a placeholder "
+                                "before reporting."
+                            ),
+                            validation_limitations=(
+                                "Pattern matching can produce false positives. "
+                                "Verify the secret is active by attempting to use it "
+                                "against the relevant API. Do not use the secret beyond "
+                                "what is necessary to confirm it is valid."
+                            ),
+                            structured_test_result={
+                                "schema_version": 1,
+                                "method": "passive_js_scan",
+                                "test_type": "secret_pattern_match",
+                                "observation": "pattern_matched",
+                                "secret_type": s["label"],
+                                "source_file": js_url,
+                                "response_origin": "fresh",
+                                "evidence_completeness": "partial",
+                                "not_established": [
+                                    "secret_is_active",
+                                    "exploitability",
+                                    "impact",
+                                ],
+                            },
+                        )
+
+                if results["endpoints"]:
+                    for e in results["endpoints"]:
+                        print(f"    [ENDPOINT] {e['path']}")
+
+                if not results["secrets"] and not results["endpoints"]:
+                    print("    [OK] No secrets or endpoints found.")
+
+            finally:
+                resp.close()
+
+        except requests.RequestException as e:
+            if budget_state is not None and budget_state.get("exhausted"):
+                raise
+            print(f"    [ERROR] Could not fetch {js_url}: {type(e).__name__}")
+
+    total_secrets   = len(all_secrets)
+    total_endpoints = len(all_endpoints)
+
+    if total_secrets > 0:
+        print(f"  {total_secrets} potential secret(s) found — candidates recorded.")
+    if total_endpoints > 0:
+        print(f"  {total_endpoints} internal endpoint(s) found.")
+    if total_secrets == 0 and total_endpoints == 0:
+        print("  No secrets or endpoints found.")
+
+    return {"secrets": all_secrets, "endpoints": all_endpoints}
+
 def crawl_local_pages(
     start_url, max_pages=50, response_cache=None, initial_response=None,
     coverage_issues=None,
@@ -2295,6 +2580,23 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
         else:
             print("SQL Injection Checks: skipped (use --active to enable)")
             report.append("SQL Injection Checks: skipped; --active opt-in required.")
+        print()
+        report.append("")
+        # --- JavaScript secret scanning (passive) ---
+        print()
+        print("JavaScript Analysis:")
+        report.append("JavaScript Analysis:")
+        _js_results = audit_js_files(response, budget_state=budget_state)
+        if _js_results["secrets"]:
+            report.append("  Potential Secrets:")
+            for _s in _js_results["secrets"]:
+                report.append(f"    [{_s['severity']}] {_s['label']} in {_s['source']}")
+        else:
+            report.append("  No secrets found in JS files.")
+        if _js_results["endpoints"]:
+            report.append("  Endpoints in JS:")
+            for _e in _js_results["endpoints"]:
+                report.append(f"    {_e['path']}  (from {_e['source']})")
         print()
         report.append("")
 
