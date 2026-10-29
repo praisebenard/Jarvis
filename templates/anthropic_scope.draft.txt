@@ -1,0 +1,19 @@
+# DRAFT ONLY — NOT AUTHORIZED FOR LIVE TESTING
+# This file is not loaded by JARVIS and grants no authorization.
+# Keep the active scope.txt limited to explicitly authorized assets.
+# Before any future testing, manually verify current program rules, the exact
+# asset, permitted methods, and any exclusions. Do not add guessed hosts,
+# wildcards across domains, staging assets, or third-party services.
+#
+# Replace placeholders only after authorization is verified. Scope rules must
+# state scheme, exact hostname, explicit port, and authorized path:
+# ALLOW <scheme>://<exact-authorized-host>:<port>/<authorized-path>/*
+# EXCLUDE <scheme>://<exact-authorized-host>:<port>/<excluded-path>/*
+#
+# Optional HackerOne header configuration is runtime-only. Set these locally
+# only when appropriate; do not put a handle, credentials, keys, or cookies in
+# this template or source control:
+# JARVIS_HACKERONE_HANDLE=<your configured handle>
+# JARVIS_HACKERONE_ASSETS=<explicit scheme://host:port/path patterns>
+# These header asset patterns do not grant scope. Every request and redirect
+# must independently match active scope.txt.

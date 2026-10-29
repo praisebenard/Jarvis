@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import ipaddress
 import io
+import os
 import re
 import tempfile
 import unittest
@@ -44,12 +45,38 @@ class FakeSession:
         return response
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.sleeps.append(duration)
+        self.now += duration
+
+
+def mock_scope_context(target):
+    parsed = urlsplit(target)
+    path = parsed.path or "/"
+    path_root = "/bWAPP" if path == "/bWAPP" or path.startswith("/bWAPP/") else "/"
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    return (parsed.scheme.lower(), (parsed.hostname or "").lower(), port, path_root, True)
+
+
 class ActiveAuditControlTests(unittest.TestCase):
     def setUp(self):
         self.source_path = Path(__file__).resolve().parents[1] / "jarvis.py"
         tree = ast.parse(self.source_path.read_text())
         names = {
-            "scoped_get", "check_reflection", "_classify_reflection_context",
+            "scoped_get", "_session_for_url",
+            "_hackerone_handle_for_url", "_remove_hackerone_header",
+            "_keep_safe_redirect_headers",
+            "_snapshot_http_response_metadata", "_attach_http_response_metadata",
+            "_parse_scope_url", "_scope_path_matches",
+            "check_reflection", "_classify_reflection_context",
             "_parse_audit_options",
             "_escape_report_header_value",
             "_safe_report_parameter_name", "_render_report_endpoint",
@@ -64,19 +91,27 @@ class ActiveAuditControlTests(unittest.TestCase):
             "crawl_local_pages",
             "_get_audit_page_data",
             "_build_findings_summary",
+            "_split_saved_report_lines",
         }
         functions = [
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name in names
         ]
         self.candidates = []
+        self.findings = []
         self.saved_reports = []
         self.scope_checks = []
         self.session = None
+        self.clock = FakeClock()
         self.namespace = {
             "Path": Path,
             "re": re,
+            "os": os,
             "requests": requests,
+            "time": SimpleNamespace(
+                monotonic=self.clock.monotonic,
+                sleep=self.clock.sleep,
+            ),
             "datetime": datetime,
             "urljoin": urljoin,
             "quote": quote,
@@ -92,8 +127,12 @@ class ActiveAuditControlTests(unittest.TestCase):
             "SimpleNamespace": SimpleNamespace,
             "DEFAULT_AUDIT_REQUEST_BUDGET": 25,
             "MAX_AUDIT_REQUEST_BUDGET": 100,
+            "DEFAULT_AUDIT_REQUEST_INTERVAL_SECONDS": 0.25,
+            "MAX_REDIRECT_HOPS": 5,
             "_ACTIVE_AUDIT_REQUEST_BUDGET": None,
+            "_HTTP_SESSIONS": {},
             "check_scope": lambda target, **kwargs: self.scope_checks.append(target) or True,
+            "_authorized_scope_context": mock_scope_context,
             "get_url": lambda target: target,
             "crawl_local_pages": lambda url, **kwargs: [],
             "audit_local_pages": lambda pages, *args, **kwargs: None,
@@ -103,9 +142,17 @@ class ActiveAuditControlTests(unittest.TestCase):
             "identify_high_risk_parameters": lambda parameters: [],
             "identify_review_areas": lambda parameters: [],
             "record_candidate": lambda *args, **kwargs: self.candidates.append((args, kwargs)),
-            "record_finding": lambda *args, **kwargs: None,
+            "record_finding": lambda *args, **kwargs: self.findings.append((args, kwargs)),
             "save_report": lambda target, report: self.saved_reports.append((target, report)),
             "REPORTS_DIR": Path("reports"),
+            # These isolated summary tests do not exercise review-note storage.
+            # Model an empty, healthy sidecar store while preserving the
+            # summary's reviewer-status section.
+            "_read_review_notes": lambda root: ([], 0, None),
+            "_latest_validation_status": lambda notes, report_name: "UNVERIFIED",
+            "_VALIDATION_STATUSES": {
+                "OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE",
+            },
         }
         exec(
             compile(
@@ -138,6 +185,21 @@ class ActiveAuditControlTests(unittest.TestCase):
             "explicit --active opt-in required",
             "\n".join(self.saved_reports[0][1]),
         )
+
+    def test_default_audit_budget_applies_request_pacing_to_page_fetches(self):
+        first = FakeResponse(url="https://authorized.example/")
+        second = FakeResponse(url="https://authorized.example/second")
+        self.set_responses(first, second)
+        second_url = "https://authorized.example/second"
+        self.namespace["crawl_local_pages"] = lambda url, **kwargs: [{
+            "requested_url": second_url,
+            "display_url": second_url,
+        }]
+
+        self.run_audit("https://authorized.example/")
+
+        self.assertEqual(len(self.session.calls), 2)
+        self.assertEqual(self.clock.sleeps, [0.25])
 
     def test_page_cache_is_not_shared_between_audit_runs(self):
         self.set_responses(FakeResponse())
@@ -193,7 +255,10 @@ class ActiveAuditControlTests(unittest.TestCase):
     def test_explicit_opt_in_sends_reflection_probe_through_scoped_get(self):
         self.set_responses(
             FakeResponse(url="https://authorized.example/?q=old&keep=yes"),
-            FakeResponse(text="value JARVIS_TEST_12345 appeared"),
+            FakeResponse(
+                url="https://authorized.example/?q=JARVIS_TEST_12345&keep=yes",
+                text="value JARVIS_TEST_12345 appeared",
+            ),
         )
 
         self.run_audit(
@@ -215,6 +280,28 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertIn("Reflection context: HTML text", evidence)
         self.assertIn("best-effort HTML parsing", evidence)
         self.assertIn("Browser execution was not assessed", evidence)
+        self.assertIn("marker appeared in the HTTP response text", reflection_candidate[1]["observed_evidence"])
+        self.assertEqual(
+            reflection_candidate[1]["evidence_source"],
+            "JARVIS active GET reflection check",
+        )
+        self.assertEqual(
+            reflection_candidate[1]["evidence_endpoint"],
+            "https://authorized.example/?q=JARVIS_TEST_12345&keep=yes",
+        )
+        self.assertIn("does not establish script execution", reflection_candidate[1]["scanner_interpretation"])
+        self.assertIn("response body was not saved", reflection_candidate[1]["validation_limitations"])
+        test_result = reflection_candidate[1]["structured_test_result"]
+        self.assertEqual(test_result["test_type"], "harmless_reflection_marker")
+        self.assertEqual(test_result["observation"], "marker_reflected")
+        self.assertEqual(test_result["requested_endpoint"], self.session.calls[1][0])
+        self.assertEqual(test_result["final_response_endpoint"], "https://authorized.example/?q=JARVIS_TEST_12345&keep=yes")
+        self.assertEqual(test_result["response_origin"], "fresh")
+        self.assertEqual(test_result["evidence_completeness"], "complete")
+        self.assertEqual(
+            set(test_result["not_established"]),
+            {"browser_execution", "exploitability", "impact"},
+        )
         self.assertIn("no exploit payload sent", reflection_candidate[1]["testing_context"])
 
     def test_reflection_reports_html_text_attribute_and_script_contexts(self):
@@ -606,6 +693,39 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertNotIn("lab-password", denied.getvalue())
         self.assertNotIn("target-secret", denied.getvalue())
 
+    def test_redirect_location_secrets_are_not_rendered_in_audit_report(self):
+        entry_url = "http://127.0.0.1/bWAPP/index.php?token=request-secret"
+        location = (
+            "http://lab-user:lab-password@127.0.0.1/bWAPP/final.php?"
+            "api_key=redirect-secret"
+        )
+        redirect = FakeResponse(
+            url=entry_url,
+            headers={
+                "Location": location,
+                "Content-Type": "text/html; charset=utf-8",
+            },
+        )
+        redirect.is_redirect = True
+        final_response = FakeResponse(
+            url=location,
+            text="<title>Local lab page</title>",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+        self.set_responses(redirect, final_response)
+
+        output = self.run_audit(entry_url)
+        report = "\n".join(self.saved_reports[0][1])
+        for secret in (
+            "request-secret", "lab-user", "lab-password", "redirect-secret",
+        ):
+            self.assertNotIn(secret, output)
+            self.assertNotIn(secret, report)
+        self.assertIn("api_key=%5BREDACTED%5D", report)
+        self.assertTrue(redirect.closed)
+        self.assertTrue(final_response.closed)
+        self.assertEqual(len(self.session.calls), 2)
+
     def test_form_markup_values_and_names_are_safe_in_console_and_report(self):
         target = "https://authorized.example/bWAPP/index.php"
         secret = "csrf-hidden-secret"
@@ -782,7 +902,7 @@ class ActiveAuditControlTests(unittest.TestCase):
         )
         self.assertTrue(all("params" not in call[1] for call in self.session.calls))
 
-    def test_sql_name_candidates_keep_their_discovered_get_endpoint(self):
+    def test_sql_name_matches_remain_detection_signals_without_sql_evidence(self):
         entry_url = "http://127.0.0.1/bWAPP/index.php"
         first_url = "http://127.0.0.1/bWAPP/item.php?id=1"
         second_url = "http://127.0.0.1/bWAPP/item.php?id=2"
@@ -804,28 +924,57 @@ class ActiveAuditControlTests(unittest.TestCase):
             candidate for candidate in self.candidates
             if candidate[0][1] == "SQL Injection"
         ]
-        self.assertEqual(len(sql_candidates), 2)
-        evidence = [candidate[0][4] for candidate in sql_candidates]
-        self.assertEqual(len(set(evidence)), 2)
-        self.assertTrue(any(
+        self.assertEqual(sql_candidates, [])
+        report = "\n".join(self.saved_reports[0][1])
+        self.assertIn("SQL Injection Heuristic Signals:", report)
+        self.assertIn(
+            "Detected review signal: GET parameter 'id'\n"
             "Discovered GET endpoint (variant 1): "
-            + self.namespace["_render_report_endpoint"](first_url) in item
-            for item in evidence
-        ))
-        self.assertTrue(any(
+            + self.namespace["_render_report_endpoint"](first_url),
+            report,
+        )
+        self.assertIn(
+            "Detected review signal: GET parameter 'id'\n"
             "Discovered GET endpoint (variant 2): "
-            + self.namespace["_render_report_endpoint"](second_url) in item
-            for item in evidence
-        ))
-        self.assertTrue(all(
-            candidate[0][2] == "Potential High"
-            and "parameter-name match only" in candidate[0][4]
-            and "query handling was not observed" in candidate[0][4]
-            for candidate in sql_candidates
-        ))
-        self.assertTrue(all(
-            "id=1" not in item and "id=2" not in item for item in evidence
-        ))
+            + self.namespace["_render_report_endpoint"](second_url),
+            report,
+        )
+        self.assertIn("parameter-name heuristic only", report)
+        self.assertIn("no SQL injection candidate or vulnerability was established", report)
+
+    def test_inventory_review_area_does_not_create_a_vulnerability_finding(self):
+        self.set_responses(
+            FakeResponse(url="https://authorized.example/item.php?display_name=alice")
+        )
+        self.namespace["identify_review_areas"] = lambda parameters: [
+            "GET parameter 'display_name': input handling"
+        ]
+
+        self.run_audit("https://authorized.example/item.php?display_name=alice")
+
+        report = "\n".join(self.saved_reports[0][1])
+        self.assertEqual(self.findings, [])
+        self.assertIn("Review Areas:", report)
+        self.assertIn("Inventory-based review prompts only; these are not vulnerability findings.", report)
+        self.assertIn("GET parameter 'display_name': input handling", report)
+
+    def test_name_only_high_risk_signal_does_not_suggest_a_severity(self):
+        self.set_responses(
+            FakeResponse(url="https://authorized.example/item.php?file=readme")
+        )
+        self.namespace["identify_high_risk_parameters"] = lambda parameters: [
+            "GET parameter 'file' requires high-risk input review"
+        ]
+
+        self.run_audit("https://authorized.example/item.php?file=readme")
+
+        candidate = next(
+            item for item in self.candidates if item[0][1] == "High-Risk Input"
+        )
+        self.assertEqual(candidate[0][2], "")
+        self.assertEqual(candidate[1]["observation_confidence"], "Heuristic candidate: parameter-name match")
+        self.assertIn("parameter name was present", candidate[1]["observed_evidence"])
+        self.assertIn("behavior was not tested", candidate[1]["scanner_interpretation"])
 
     def test_reflection_preserves_repeated_blank_query_values_and_fragment(self):
         source_url = (
@@ -1151,6 +1300,38 @@ class ActiveAuditControlTests(unittest.TestCase):
         self.assertIn("[PRESENT] X-Frame-Options -", report)
         self.assertIn("  Observed value: SAMEORIGIN", report)
         self.assertIn("[MISSING] Content-Security-Policy -", report)
+
+    def test_web_info_closes_response_after_success_and_processing_error(self):
+        successful_response = FakeResponse()
+        self.set_responses(successful_response)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.namespace["get_info"]("https://authorized.example/")
+
+        self.assertTrue(successful_response.closed)
+        self.assertEqual(len(self.saved_reports), 1)
+
+        class TextErrorResponse(FakeResponse):
+            def __init__(self):
+                self.url = "https://authorized.example/"
+                self.status_code = 200
+                self.headers = {}
+                self.is_redirect = False
+                self.closed = False
+
+            @property
+            def text(self):
+                raise requests.RequestException("response body unavailable")
+
+        failed_response = TextErrorResponse()
+        self.set_responses(failed_response)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.namespace["get_info"]("https://authorized.example/")
+
+        self.assertTrue(failed_response.closed)
+        self.assertEqual(len(self.saved_reports), 1)
 
     def test_web_info_report_marks_unavailable_header_mapping_not_recorded(self):
         response = FakeResponse()
@@ -1501,6 +1682,53 @@ class FormControlInventoryTests(unittest.TestCase):
                 ("POST", "csrf", None),
             ],
         )
+        self.assertEqual(
+            [item.get("form_action") for item in parameters],
+            [
+                "http://127.0.0.1/search.php",
+                "http://127.0.0.1/default.php",
+                "http://127.0.0.1/bWAPP/forms.php",
+            ],
+        )
+
+    def test_form_control_risk_labels_are_advisory_and_value_free(self):
+        html = (
+            '<input type="password" name="account_password" value="never-log">'
+            '<input type="hidden" name="redirect_to" value="/private">'
+            '<input name="search_term" value="private-query">'
+            '<select name="csrf_token"><option value="secret">Choice</option></select>'
+        )
+        controls = self.namespace["_form_control_inventory"](html)
+
+        self.assertEqual(
+            [item["risk"] for item in controls],
+            ["sensitive", "action-related", "review-only", "sensitive"],
+        )
+        self.assertTrue(all("value" not in item for item in controls))
+        self.assertTrue(all("risk" in item for item in controls))
+
+
+    def test_form_summary_renders_risk_labels_without_field_values(self):
+        html = (
+            '<form method="post" action="/submit">'
+            '<input type="password" name="password" value="never-log">'
+            '<input type="hidden" name="redirect_to" value="/private">'
+            '<input type="text" name="search" value="private-query">'
+            '</form>'
+        )
+
+        rendered = "\\n".join(
+            self.namespace["_summarize_form"](
+                html, "http://127.0.0.1/bWAPP/forms.php"
+            )
+        )
+
+        self.assertIn("risk=sensitive", rendered)
+        self.assertIn("risk=action-related", rendered)
+        self.assertIn("risk=review-only", rendered)
+        self.assertNotIn("never-log", rendered)
+        self.assertNotIn("private-query", rendered)
+
 
     def test_form_method_inventory_ignores_data_method_attribute(self):
         self.response = FakeResponse(
@@ -1583,8 +1811,14 @@ class AuditPageCacheTests(unittest.TestCase):
         source_path = Path(__file__).resolve().parents[1] / "jarvis.py"
         tree = ast.parse(source_path.read_text())
         names = {
-            "scoped_get", "_get_audit_page_data", "crawl_local_pages",
+            "scoped_get", "_session_for_url",
+            "_hackerone_handle_for_url", "_remove_hackerone_header",
+            "_keep_safe_redirect_headers",
+            "_snapshot_http_response_metadata", "_attach_http_response_metadata",
+            "_parse_scope_url", "_scope_path_matches",
+            "_get_audit_page_data", "crawl_local_pages",
             "audit_local_pages", "inventory_local_forms", "discover_links",
+            "get_page_title",
             "_safe_report_parameter_name", "_render_report_endpoint",
             "_escape_report_user_field", "_escape_report_header_value",
         }
@@ -1594,9 +1828,19 @@ class AuditPageCacheTests(unittest.TestCase):
         ]
         self.scope_checks = []
         self.session = None
+        self.clock = FakeClock()
         self.namespace = {
             "re": re,
+            "os": os,
+            "ipaddress": ipaddress,
+            "unquote": unquote,
             "requests": requests,
+            "time": SimpleNamespace(
+                monotonic=self.clock.monotonic,
+                sleep=self.clock.sleep,
+            ),
+            "MAX_REDIRECT_HOPS": 5,
+            "_HTTP_SESSIONS": {},
             "urljoin": urljoin,
             "quote": quote,
             "quote_from_bytes": quote_from_bytes,
@@ -1607,8 +1851,8 @@ class AuditPageCacheTests(unittest.TestCase):
             "SimpleNamespace": SimpleNamespace,
             "_ACTIVE_AUDIT_REQUEST_BUDGET": None,
             "check_scope": lambda url, **kwargs: self.scope_checks.append(url) or True,
+            "_authorized_scope_context": mock_scope_context,
             "discover_forms": lambda response: [],
-            "get_page_title": lambda response: "Cache fixture",
         }
         exec(
             compile(
@@ -1622,6 +1866,62 @@ class AuditPageCacheTests(unittest.TestCase):
     def set_responses(self, *responses):
         self.session = FakeSession(responses)
         self.namespace["session"] = self.session
+
+    def test_page_audit_output_associates_each_request_with_its_response(self):
+        first_requested = "http://127.0.0.1/bWAPP/first.php?token=first-secret"
+        second_requested = "http://127.0.0.1/bWAPP/second.php?token=second-secret"
+        first_final = "http://127.0.0.1/bWAPP/landing_one.php?key=hidden-one"
+        second_final = "http://127.0.0.1/bWAPP/landing_two.php?key=hidden-two"
+        first_response = FakeResponse(
+            url=first_final,
+            text="<title>First response title</title>",
+        )
+        second_response = FakeResponse(
+            url=second_final,
+            text="<title>Second response title</title>",
+        )
+        self.set_responses(first_response, second_response)
+        cache = {}
+        self.namespace["_get_audit_page_data"](first_requested, cache)
+        self.namespace["_get_audit_page_data"](second_requested, cache)
+        pages = [
+            {"requested_url": first_requested, "display_url": first_requested},
+            {"requested_url": second_requested, "display_url": second_requested},
+        ]
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.namespace["audit_local_pages"](pages, cache)
+
+        rendered = output.getvalue()
+        first_segment = rendered.index("Requested URL: http://127.0.0.1/bWAPP/first.php")
+        first_status = rendered.index("Status: 200", first_segment)
+        first_final_position = rendered.index(
+            "Final URL: http://127.0.0.1/bWAPP/landing_one.php", first_status
+        )
+        first_title = rendered.index("Title: First response title", first_final_position)
+        second_segment = rendered.index(
+            "Requested URL: http://127.0.0.1/bWAPP/second.php", first_title
+        )
+        second_final_position = rendered.index(
+            "Final URL: http://127.0.0.1/bWAPP/landing_two.php", second_segment
+        )
+        second_title = rendered.index("Title: Second response title", second_final_position)
+
+        self.assertLess(first_segment, first_status)
+        self.assertLess(first_status, first_final_position)
+        self.assertLess(first_final_position, first_title)
+        self.assertLess(first_title, second_segment)
+        self.assertLess(second_segment, second_final_position)
+        self.assertLess(second_final_position, second_title)
+        for secret in ("first-secret", "second-secret", "hidden-one", "hidden-two"):
+            self.assertNotIn(secret, rendered)
+        self.assertTrue(first_response.closed)
+        self.assertTrue(second_response.closed)
+        self.assertEqual(
+            [call[0] for call in self.session.calls],
+            [first_requested, second_requested],
+        )
 
     def test_exact_urls_are_fetched_once_across_all_page_phases(self):
         entry = "http://127.0.0.1/bWAPP/index.php"
@@ -1704,6 +2004,75 @@ class AuditPageCacheTests(unittest.TestCase):
         self.assertTrue(redirect.closed)
         self.assertTrue(final_response.closed)
 
+    def test_redirect_chain_metadata_is_cached_without_other_headers_or_body(self):
+        entry = "http://127.0.0.1/bWAPP/index.php"
+        location = (
+            "http://127.0.0.1/bWAPP/final.php?token=exact-location-value"
+        )
+        redirect = FakeResponse(
+            url=entry,
+            headers={
+                "Location": location,
+                "Content-Type": "text/html; redirect=original",
+                "Set-Cookie": "session=not-retained-in-metadata",
+                "Authorization": "Bearer not-retained-in-metadata",
+            },
+        )
+        redirect.status_code = 302
+        redirect.is_redirect = True
+        final_response = FakeResponse(
+            url=location,
+            text="page body is available to crawler but not response metadata",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+        self.set_responses(redirect, final_response)
+        cache = {}
+
+        page_data = self.namespace["_get_audit_page_data"](entry, cache)
+
+        self.assertEqual(len(page_data.response_metadata), 2)
+        original_hop, final_hop = page_data.response_metadata
+        self.assertEqual(
+            (original_hop.status_code, original_hop.content_type, original_hop.location),
+            (302, "text/html; redirect=original", location),
+        )
+        self.assertEqual(
+            (final_hop.status_code, final_hop.content_type, final_hop.location),
+            (200, "text/html; charset=utf-8", None),
+        )
+        for item in page_data.response_metadata:
+            self.assertEqual(
+                set(vars(item)), {"status_code", "content_type", "location"}
+            )
+            self.assertNotIn("text", vars(item))
+            self.assertNotIn("headers", vars(item))
+        self.assertEqual(page_data.text, final_response.text)
+        self.assertTrue(redirect.closed)
+        self.assertTrue(final_response.closed)
+
+    def test_redirect_without_location_retains_metadata_and_does_not_follow(self):
+        response = FakeResponse(
+            url="http://127.0.0.1/bWAPP/redirect.php",
+            headers={"Content-Type": "text/html"},
+        )
+        response.status_code = 302
+        response.is_redirect = True
+        self.set_responses(response)
+        cache = {}
+
+        page_data = self.namespace["_get_audit_page_data"](
+            response.url, cache
+        )
+
+        self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(
+            (page_data.response_metadata[0].status_code,
+             page_data.response_metadata[0].content_type,
+             page_data.response_metadata[0].location),
+            (302, "text/html", None),
+        )
+        self.assertTrue(response.closed)
+
     def test_scope_is_checked_before_a_cached_page_is_returned(self):
         blocked = "http://127.0.0.1/bWAPP/admin/page.php?id=1"
         self.namespace["check_scope"] = lambda url, **kwargs: url != blocked
@@ -1724,17 +2093,25 @@ class AuditPageCacheTests(unittest.TestCase):
 
     def test_cache_miss_redirect_still_validates_and_closes_blocked_hop(self):
         entry = "http://127.0.0.1/bWAPP/index.php"
-        redirect = FakeResponse(url=entry, headers={"Location": "http://outside.test/"})
+        blocked_location = "http://outside.test/path?token=blocked-secret"
+        redirect = FakeResponse(url=entry, headers={"Location": blocked_location})
+        redirect.status_code = 302
         redirect.is_redirect = True
         self.set_responses(redirect)
         self.namespace["check_scope"] = lambda url, **kwargs: "outside.test" not in url
         cache = {}
 
-        with self.assertRaises(requests.RequestException):
+        with self.assertRaises(requests.RequestException) as raised:
             self.namespace["_get_audit_page_data"](entry, cache)
 
         self.assertEqual(len(self.session.calls), 1)
+        self.assertNotIn("blocked-secret", str(raised.exception))
         self.assertTrue(redirect.closed)
+        self.assertEqual(
+            (redirect._jarvis_response_metadata[0].status_code,
+             redirect._jarvis_response_metadata[0].location),
+            (302, blocked_location),
+        )
         self.assertEqual(cache, {})
 
     def test_cache_miss_redirect_hops_consume_budget_before_next_request(self):

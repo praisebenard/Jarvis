@@ -1,0 +1,26 @@
+ANTHROPIC HACKERONE POLICY REVIEW CHECKLIST — MANUAL REVIEW ONLY
+
+This checklist reflects policy details supplied by the user and may be
+outdated. Verify the current official program rules before making decisions.
+It does not authorize testing, confirm a vulnerability, or establish bounty
+eligibility. JARVIS and AI-generated alerts remain unverified until manually
+validated.
+
+[ ] Is the exact asset, scheme, port, and path explicitly in active scope?
+[ ] Are the testing methods permitted by the current program rules?
+[ ] Is there a reproducible, manually validated security impact?
+[ ] Are safe reproduction steps and evidence sufficient for another researcher?
+[ ] Could the issue fall into a policy exclusion?
+[ ] Is it a duplicate or potentially the same root cause as another report?
+[ ] Can it be demonstrated without other users' accounts, private data, or disruption?
+[ ] Does the report contain only the minimum evidence needed, with secrets redacted?
+
+Potential exclusion warnings from the supplied policy summary:
+- Denial of service, disruptive testing, brute force, and unauthenticated rate-limit testing.
+- Social engineering, phishing, and attacks on accounts the researcher does not own.
+- Clickjacking without a sensitive action; missing cookie flags alone.
+- Generic TLS/security best-practice findings without working proof of impact.
+- Model jailbreaks, harmful model outputs, and hallucinations under the technical program.
+- Potential duplicate/root-cause overlap with the Claude Code permission-modal bypass remediation.
+
+These are review warnings, not a substitute for checking the current official rules.

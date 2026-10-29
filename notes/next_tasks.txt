@@ -70,3 +70,19 @@ JARVIS NEXT TASKS
     original-URL preservation; both were reviewed read-only. Focused scope and
     redirect tests passed 21 tests; the full suite passed 167 tests. No audits
     or network requests were performed.
+19. VERIFIED — GET form actions that differ only by URL fragments now share a
+    fragment-free request identity for endpoint/parameter deduplication, while
+    retaining the first original endpoint for provenance. Query variants
+    remain distinct. Regression tests reproduce the duplicate-probe budget
+    exhaustion and verify distinct query variants remain separate. Focused
+    active-audit tests passed 55 tests; the full suite passed 221 tests, 0
+    failures. `python3 -m py_compile jarvis.py` and `git diff --check` passed.
+    No audits or network requests were performed.
+20. VERIFIED — form-control risk classification labels controls as
+    `sensitive`, `action-related`, or `review-only` without retaining field
+    values in control metadata. Form-summary output includes the risk labels
+    and regression coverage confirms test field values are not exposed.
+    Focused form-control tests passed 9 tests; the full suite passed 391 tests,
+    0 failures. `python3 -m py_compile jarvis.py` and `git diff --check`
+    passed. Verification used synthetic HTML; no audits or network requests
+    were performed.

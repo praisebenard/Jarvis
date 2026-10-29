@@ -1,0 +1,1 @@
+target.innerHTML = location.search;

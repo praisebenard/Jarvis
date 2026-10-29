@@ -6,6 +6,42 @@ from pathlib import Path
 
 
 class PHPFlowCLITests(unittest.TestCase):
+    def test_readme_scope_and_synthetic_php_flow_example(self):
+        project_root = Path(__file__).resolve().parents[1]
+
+        with tempfile.TemporaryDirectory(prefix="jarvis-readme-cli-") as temp:
+            workdir = Path(temp)
+            fixture = workdir / "jarvis-demo.php"
+            fixture.write_text(
+                "<?php\n$message = $_GET['message'];\necho $message;\n"
+            )
+            commands = (
+                "scope\n"
+                "check http://127.0.0.1:80/bWAPP/\n"
+                f"php-flow {fixture}\n"
+                "exit\n"
+            )
+            result = subprocess.run(
+                [sys.executable, str(project_root / "jarvis.py")],
+                input=commands,
+                text=True,
+                capture_output=True,
+                cwd=workdir,
+                timeout=20,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "ALLOW http://127.0.0.1:80/bWAPP/*", result.stdout
+            )
+            self.assertIn("is in the authorized scope", result.stdout)
+            report = workdir / "reports" / "jarvis-demo_php_flow.txt"
+            self.assertTrue(report.is_file())
+            report_text = report.read_text()
+            self.assertIn("Explicit textual relationship: [GET] message", report_text)
+            self.assertIn("Vulnerability status: UNCONFIRMED", report_text)
+
     def test_php_flow_cases_through_interactive_cli(self):
         project_root = Path(__file__).resolve().parents[1]
         cases = {
@@ -255,8 +291,10 @@ if ($enabled)
             self.assertNotIn("Explicit textual relationship", split_unrelated)
 
             split_nested = (reports_dir / "cli_next_line_brace_nested_case_php_flow.txt").read_text()
-            self.assertIn("Unresolved unsupported conditional structure", split_nested)
-            self.assertNotIn("Conditional textual relationship", split_nested)
+            self.assertIn("Conditional textual relationship: [GET] id", split_nested)
+            self.assertIn("Guard condition: if ($enabled)", split_nested)
+            self.assertIn("Guard condition: if ($other)", split_nested)
+            self.assertNotIn("Unresolved unsupported conditional structure", split_nested)
             self.assertNotIn("Explicit textual relationship", split_nested)
 
             self.assertEqual(len(list(reports_dir.glob("*_php_flow.txt"))), len(cases))

@@ -31,6 +31,8 @@ class FindingReportTests(unittest.TestCase):
             "_report_target_filename_component",
             "_report_display_entries",
             "_safe_report_display_text",
+            "_safe_report_output_text",
+            "_split_saved_report_lines",
             "list_reports",
             "view_report",
             "save_report",
@@ -44,12 +46,20 @@ class FindingReportTests(unittest.TestCase):
             "review_note_workflow",
             "_is_safe_review_note_filename",
             "_read_review_notes",
+            "_sanitize_reviewer_text",
+            "_normalize_validation_record",
+            "_latest_validation_status",
             "review_notes_workflow",
+            "validation_note_workflow",
             "_report_remediation",
+            "_candidate_report_title_and_impact",
+            "_normalize_structured_test_result",
             "_report_evidence_location",
+            "_redact_potential_secrets",
             "record_finding",
             "record_candidate",
             "show_help",
+            "hackerone_policy_review_checklist",
         }
         functions = [
             node for node in tree.body
@@ -68,7 +78,22 @@ class FindingReportTests(unittest.TestCase):
             "urlunsplit": urlunsplit,
             "datetime": datetime,
             "json": json,
-            "check_scope": lambda target: True,
+            "check_scope": lambda target, announce=True: True,
+            "_VALIDATION_STATUSES": {
+                "OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE",
+            },
+            "_VALIDATION_DETAIL_FIELDS": (
+                "endpoint", "category", "severity", "severity_justification", "preconditions",
+                "reproduction_steps", "expected_behavior", "actual_behavior", "evidence",
+                "impact", "limitations", "remediation",
+            ),
+            "_VALIDATION_TRANSITIONS": {
+                "OBSERVED": {"OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE"},
+                "UNVERIFIED": {"OBSERVED", "UNVERIFIED", "VALIDATED", "NOT_REPRODUCIBLE", "FALSE_POSITIVE"},
+                "VALIDATED": {"UNVERIFIED"},
+                "NOT_REPRODUCIBLE": {"UNVERIFIED"},
+                "FALSE_POSITIVE": {"UNVERIFIED"},
+            },
         }
         exec(
             compile(
@@ -90,6 +115,7 @@ class FindingReportTests(unittest.TestCase):
         self.read_review_notes = namespace["_read_review_notes"]
         self.build_review_progress = namespace["_build_review_progress"]
         self.show_review_progress = namespace["show_review_progress"]
+        self.show_findings_summary = namespace["show_findings_summary"]
         self.namespace = namespace
         self.show_help = namespace["show_help"]
         self.save_report = namespace["save_report"]
@@ -103,6 +129,36 @@ class FindingReportTests(unittest.TestCase):
         path = reports / name
         path.write_text(text)
         return path
+
+    def report_alias(self, report_name):
+        return next(
+            alias
+            for alias, name in self.namespace["_REPORT_DISPLAY_ALIASES"].items()
+            if name == report_name
+        )
+
+    def validation_details(self, **overrides):
+        details = {
+            "endpoint": "http://127.0.0.1/bWAPP/demo.php?token=synthetic-secret",
+            "category": "Output handling",
+            "severity": "Low",
+            "severity_justification": "Limited to the local demonstration page.",
+            "preconditions": "Use the local synthetic fixture.",
+            "reproduction_steps": "1. Open the local fixture.\n2. Submit the harmless value.",
+            "expected_behavior": "The value is encoded as text.",
+            "actual_behavior": "The value remains in an HTML attribute.",
+            "evidence": (
+                "Authorization: Bearer synthetic-bearer\n"
+                "Cookie: session=synthetic-session\n"
+                "X-API-Key: synthetic-api-secret\n"
+                "Contact synthetic.user@example.test; observed only in the local fixture."
+            ),
+            "impact": "Potential client-side interpretation; no execution demonstrated.",
+            "limitations": "Browser execution and real-world impact were not tested.",
+            "remediation": "Apply context-appropriate output encoding.",
+        }
+        details.update(overrides)
+        return details
 
     def test_empty_report_directory_has_read_only_empty_summary(self):
         report_dir = self.root / "reports"
@@ -160,7 +216,7 @@ Unknown; no evidence was provided.
         self.assertIn("UNCONFIRMED", summary)
         self.assertIn("Evidence completeness: Incomplete", summary)
 
-    def test_mixed_statuses_require_explicit_independent_validation_evidence(self):
+    def test_narrative_validation_claims_never_promote_finding_status(self):
         self.write_report(
             "recorded.txt",
             """JARVIS POTENTIAL SECURITY FINDING
@@ -182,12 +238,43 @@ Independent validation evidence: Unknown
         )
         summary = self.build_summary(self.root / "reports")
 
-        self.assertIn("recorded.txt: CONFIRMED (as recorded)", summary)
+        self.assertIn("recorded.txt: UNCONFIRMED", summary)
         self.assertIn("unverified.txt: UNCONFIRMED", summary)
-        self.assertIn("not independently verified by this summary", summary)
         self.assertNotIn("Title: CONFIRMED SQL injection", summary)
 
-    def test_confirmation_requires_affirmative_validation_for_supported_finding_reports(self):
+    def test_fresh_retest_with_same_result_does_not_confirm_vulnerability(self):
+        result = {
+            "schema_version": 1,
+            "method": "scoped_get",
+            "test_type": "harmless_reflection_marker",
+            "observation": "marker_reflected",
+            "requested_endpoint": "https://lab.local/item.php?q=marker",
+            "final_response_endpoint": "https://lab.local/item.php?q=marker",
+            "response_origin": "fresh",
+            "evidence_completeness": "complete",
+            "not_established": ["browser_execution", "exploitability", "impact"],
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                self.record_candidate(
+                    "https://lab.local/item.php?q=marker",
+                    "Reflected Input",
+                    "Potential",
+                    "A harmless marker was reflected.",
+                    "The same harmless marker observation was recorded.",
+                    structured_test_result=result,
+                )
+
+        summary = self.build_summary(self.root / "reports")
+
+        candidate_reports = sorted((self.root / "reports").glob("*_candidate*.txt"))
+        self.assertEqual(len(candidate_reports), 2)
+        for path in candidate_reports:
+            self.assertIn('"response_origin": "fresh"', path.read_text())
+            self.assertIn(f"{path.name}: UNCONFIRMED", summary)
+        self.assertEqual(summary.count("source=fresh; completeness=complete"), 2)
+
+    def test_narrative_validation_cases_remain_unconfirmed(self):
         cases = {
             "not_performed.txt": (
                 "JARVIS POTENTIAL SECURITY FINDING",
@@ -215,6 +302,14 @@ Independent validation evidence: Unknown
                 "JARVIS POTENTIAL SECURITY FINDING",
                 "Authorized test: HTTP response observed.",
             ),
+            "cached_response_replay.txt": (
+                "JARVIS POTENTIAL SECURITY FINDING",
+                "Authorized retest replayed a cached response; it returned the same access-control bypass.",
+            ),
+            "repeated_observation.txt": (
+                "JARVIS POTENTIAL SECURITY FINDING",
+                "Authorized retest repeated the same response observation; it returned the same access-control bypass.",
+            ),
             "candidate.txt": (
                 "[+] Vulnerability candidate found",
                 "Authorized retest: expected control bypass observed and recorded.",
@@ -238,6 +333,190 @@ Independent validation evidence: Unknown
 
         for name in cases:
             self.assertIn(f"{name}: UNCONFIRMED", summary)
+
+    def test_candidate_structured_reflection_observation_is_reported_but_not_confirmed(self):
+        result = {
+            "schema_version": 1,
+            "method": "scoped_get",
+            "test_type": "harmless_reflection_marker",
+            "observation": "marker_reflected",
+            "requested_endpoint": "https://lab.local/item.php?q=JARVIS_TEST_12345",
+            "final_response_endpoint": "https://lab.local/item.php?q=JARVIS_TEST_12345",
+            "response_origin": "fresh",
+            "evidence_completeness": "complete",
+            "not_established": ["browser_execution", "exploitability", "impact"],
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.record_candidate(
+                "https://lab.local/item.php?q=JARVIS_TEST_12345",
+                "Reflected Input",
+                "Potential High",
+                "A harmless marker was reflected.",
+                "Marker response observed.",
+                observed_evidence="Harmless marker appeared in HTML text.",
+                evidence_source="JARVIS active GET reflection check",
+                evidence_endpoint="https://lab.local/item.php?q=JARVIS_TEST_12345",
+                structured_test_result=result,
+            )
+
+        report_path = next((self.root / "reports").glob("*_candidate.txt"))
+        report = report_path.read_text()
+        self.assertIn("JARVIS STRUCTURED TEST RESULT BEGIN", report)
+        self.assertIn('"response_origin": "fresh"', report)
+        self.assertIn('"observation": "marker_reflected"', report)
+        self.assertIn('"not_established": ["browser_execution", "exploitability", "impact"]', report)
+        self.assertIn("%5BREDACTED%5D", report)
+        self.assertNotIn("JARVIS_TEST_12345", report)
+        self.assertIn("Vulnerability status: UNCONFIRMED", report)
+
+        # Even an edited stored status cannot be promoted by the structured
+        # observation: reflection is not type-specific proof of exploitability.
+        report = report.replace(
+            "Vulnerability status: UNCONFIRMED; no independent validation evidence is recorded.",
+            "Vulnerability status: CONFIRMED",
+            1,
+        )
+        report_path.write_text(report)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn(f"{report_path.name}: UNCONFIRMED", summary)
+        self.assertIn(
+            "Saved structured test records (report text; not independently authenticated):",
+            summary,
+        )
+        self.assertIn("source=fresh; completeness=complete", summary)
+
+    def test_cached_structured_observation_is_recorded_as_cached_and_unconfirmed(self):
+        result = {
+            "schema_version": 1,
+            "method": "scoped_get",
+            "test_type": "harmless_reflection_marker",
+            "observation": "marker_reflected",
+            "requested_endpoint": "https://lab.local/item.php?q=marker",
+            "final_response_endpoint": "https://lab.local/item.php?q=marker",
+            "response_origin": "cached",
+            "evidence_completeness": "complete",
+            "not_established": ["browser_execution", "exploitability", "impact"],
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.record_candidate(
+                "https://lab.local/item.php?q=marker",
+                "Reflected Input",
+                "Potential",
+                "Cached observation candidate.",
+                "Marker appeared.",
+                structured_test_result=result,
+            )
+
+        report = next((self.root / "reports").glob("*_candidate.txt")).read_text()
+        self.assertIn('"response_origin": "cached"', report)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("source=cached; completeness=complete", summary)
+        self.assertIn("UNCONFIRMED", summary)
+
+    def test_malformed_structured_test_result_is_ignored(self):
+        result = {
+            "schema_version": 1,
+            "method": "scoped_get",
+            "test_type": "harmless_reflection_marker",
+            "observation": "marker_reflected",
+            "requested_endpoint": "https://lab.local/item.php",
+            "final_response_endpoint": "https://lab.local/item.php",
+            "response_origin": "fresh",
+            "evidence_completeness": "complete",
+            "not_established": ["browser_execution", "exploitability", "impact"],
+            "vulnerability_status": "CONFIRMED",
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.record_candidate(
+                "https://lab.local/item.php",
+                "Reflected Input",
+                "Potential",
+                "Malformed record candidate.",
+                "Marker appeared.",
+                structured_test_result=result,
+            )
+
+        report = next((self.root / "reports").glob("*_candidate.txt")).read_text()
+        self.assertNotIn("JARVIS STRUCTURED TEST RESULT BEGIN", report)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("UNCONFIRMED", summary)
+        self.assertIn("None recorded.", summary)
+
+    def test_heuristic_only_candidate_remains_unconfirmed_without_structured_result(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.record_candidate(
+                "https://lab.local/item.php?file=readme",
+                "High-Risk Input",
+                "",
+                "A parameter-name heuristic selected an input for review.",
+                "The name file was inventoried; behavior was not tested.",
+            )
+
+        report_path = next((self.root / "reports").glob("*_candidate.txt"))
+        report = report_path.read_text()
+        self.assertIn("Vulnerability status: UNCONFIRMED", report)
+        self.assertIn("Severity: Not assessed", report)
+        self.assertNotIn("JARVIS STRUCTURED TEST RESULT BEGIN", report)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn(f"{report_path.name}: UNCONFIRMED", summary)
+        self.assertIn("None recorded.", summary)
+
+    def test_missing_and_contradictory_structured_fields_are_ignored(self):
+        base_result = {
+            "schema_version": 1,
+            "method": "scoped_get",
+            "test_type": "harmless_reflection_marker",
+            "observation": "marker_reflected",
+            "requested_endpoint": "https://lab.local/item.php?q=marker",
+            "final_response_endpoint": "https://lab.local/item.php?q=marker",
+            "response_origin": "fresh",
+            "evidence_completeness": "complete",
+            "not_established": ["browser_execution", "exploitability", "impact"],
+        }
+        missing_endpoint = dict(base_result)
+        del missing_endpoint["final_response_endpoint"]
+        malformed_method = dict(base_result, method="unknown-method")
+        contradictory_absence = dict(
+            base_result,
+            observation="marker_not_reflected",
+            evidence_completeness="incomplete",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            for result in (missing_endpoint, malformed_method, contradictory_absence):
+                self.record_candidate(
+                    "https://lab.local/item.php?q=marker",
+                    "Reflected Input",
+                    "Potential",
+                    "Structured result edge case.",
+                    "Input was inventoried.",
+                    structured_test_result=result,
+                )
+
+        reports = sorted((self.root / "reports").glob("*_candidate*.txt"))
+        self.assertEqual(len(reports), 3)
+        self.assertTrue(all("JARVIS STRUCTURED TEST RESULT BEGIN" not in path.read_text() for path in reports))
+        summary = self.build_summary(self.root / "reports")
+        for path in reports:
+            self.assertIn(f"{path.name}: UNCONFIRMED", summary)
+
+    def test_truncated_structured_record_is_ignored_without_crashing(self):
+        self.write_report(
+            "truncated_record.txt",
+            """[+] Vulnerability candidate found
+Vulnerability status: CONFIRMED
+Validation limitations:
+The behavior and impact remain unverified.
+
+JARVIS STRUCTURED TEST RESULT BEGIN
+Structured test result (JSON): {\"schema_version\": 1}
+JARVIS STRUCTURED TEST RESULT END""",
+        )
+
+        summary = self.build_summary(self.root / "reports")
+
+        self.assertIn("truncated_record.txt: UNCONFIRMED", summary)
+        self.assertNotIn("truncated_record.txt: harmless_reflection_marker", summary)
 
     def test_severity_suggestions_remain_unassessed_without_explicit_basis(self):
         self.write_report(
@@ -410,6 +689,37 @@ Review status:
         self.assertNotIn("Observed input pattern [POST] entry_all", summary)
         self.assertNotIn("Supported static relationship", summary)
 
+    def test_php_form_controls_are_not_promoted_to_request_sources(self):
+        self.write_report(
+            "form_control_flow.txt",
+            """JARVIS: PHP source-flow analysis — stored.php
+Form control observations:
+  [textarea] name=entry at stored.php:4 (form control only; not evidence that PHP reads or uses this value).
+Input evidence:
+  No direct GET/POST/REQUEST inputs detected.
+Source-flow evidence:
+  No supported source-to-sink relationship established.
+Local function analysis:
+  Unsupported helper bodies are unresolved.
+Database operation observations:
+  Database write execution (INSERT) using $sql at stored.php:12.
+Output branch observations:
+  Output branch observation at stored.php:20: echo $row->entry;
+Unresolved request-reference evidence:
+  [POST] entry (expression value unresolved)
+    stored.php:8: xss($_POST['entry'])
+Review status:
+  UNRESOLVED INPUT EVIDENCE
+Vulnerability status: UNCONFIRMED
+""",
+        )
+        summary = self.build_summary(self.root / "reports")
+
+        self.assertIn("Unresolved request reference [POST] entry", summary)
+        self.assertNotIn("Observed input pattern [POST] entry", summary)
+        self.assertNotIn("Observed input value assignment [POST] entry", summary)
+        self.assertIn("form_control_flow.txt: UNCONFIRMED", summary)
+
     def test_saved_php_include_edges_and_unsupported_statements_are_preserved(self):
         self.write_report(
             "stored_flow.txt",
@@ -479,9 +789,9 @@ Status: Requires manual verification
         summary = self.build_summary(self.root / "reports")
 
         self.assertIn("candidate.txt: Unassessed; user-provided severity suggestion (unverified): High", summary)
-        self.assertIn("User-provided candidate evidence: Unknown; no evidence was recorded.", summary)
-        self.assertNotIn("User-provided candidate evidence: Describe your evidence", summary)
-        self.assertNotIn("User-provided candidate evidence: saved", summary)
+        self.assertIn("Recorded candidate evidence: Unknown; no evidence was recorded.", summary)
+        self.assertNotIn("Recorded candidate evidence: Describe your evidence", summary)
+        self.assertNotIn("Recorded candidate evidence: saved", summary)
         self.assertIn("Evidence: Unknown", summary)
 
     def test_saved_no_input_report_is_not_treated_as_safe_or_unrecognized(self):
@@ -723,9 +1033,61 @@ Sink observations:
             check=True,
         )
         self.assertIn("JARVIS REVIEW QUEUE", result.stdout)
-        self.assertIn("simple.txt", result.stdout)
+        self.assertRegex(result.stdout, r"(?m)^@[A-Za-z0-9_-]+$")
+        self.assertNotIn("simple.txt", result.stdout)
         self.assertIn("sample.php:8", result.stdout)
         self.assertEqual(source.read_bytes(), original)
+
+    def test_hackerone_policy_checklist_is_manual_and_covers_supplied_exclusions(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.namespace["hackerone_policy_review_checklist"]()
+        rendered = output.getvalue()
+
+        for required in (
+            "exact asset, scheme, port, and path",
+            "Confirm every proposed testing method is allowed",
+            "Manually reproduce a security impact",
+            "safe, repeatable steps",
+            "current official program policy",
+            "Claude Code permission-modal bypass remediation",
+            "other users' accounts, private data, or causing disruption",
+            "minimum evidence needed",
+            "denial of service",
+            "brute force",
+            "social engineering",
+            "Clickjacking requires a sensitive action",
+            "missing cookie flags alone",
+            "Generic TLS",
+            "Model jailbreaks",
+            "remain unverified until manually validated",
+        ):
+            self.assertIn(required, rendered)
+        self.assertNotIn("CONFIRMED", rendered)
+
+    def test_hackerone_scope_template_is_separate_and_not_authorizing(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "templates"
+            / "anthropic_scope.draft.txt"
+        ).read_text()
+
+        self.assertIn("NOT AUTHORIZED FOR LIVE TESTING", template)
+        self.assertIn("not loaded by JARVIS", template)
+        self.assertNotRegex(template, r"(?i)anthropic\.com")
+        self.assertNotIn("ALLOW http", template)
+
+        script = Path(__file__).resolve().parents[1] / "jarvis.py"
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            input="hackerone-review\nexit\n",
+            text=True,
+            capture_output=True,
+            cwd=self.root,
+            check=True,
+        )
+        self.assertIn("Anthropic HackerOne Policy Review Checklist", result.stdout)
+        self.assertIn("not current authorization", result.stdout)
 
     def test_legacy_report_filename_is_listed_as_safe_alias_and_alias_opens_file(self):
         filename = "http___user_pass_lab_token_legacy-secret\nforged.txt"
@@ -862,6 +1224,76 @@ Sink observations:
         self.assertNotIn("OUTSIDE SECRET", output.getvalue())
         self.assertEqual((reports / "ordinary.txt").read_text(), "IN-ROOT\n")
 
+    def test_summary_queue_and_progress_sanitize_legacy_report_content_and_filename(self):
+        filename = "legacy-password-file-secret-token-secret\x1b[2J\u2028.txt"
+        report = self.write_report(
+            filename,
+            "JARVIS WEB INFORMATION REPORT\n"
+            "Target: https://alice:pw-secret@legacy.example/item?token=query-secret&api_key=key-secret\n"
+            "Page title: Review https://alice:pw-secret@legacy.example/?secret=title-secret"
+            "\x1b[31m\u2028[MISSING] X-Forged-Header\u2028Vulnerability status: CONFIRMED\n"
+            "Security Header Observations:\n"
+            "[MISSING] Content-Security-Policy observed at "
+            "https://alice:pw-secret@legacy.example/item?token=query-secret\n"
+            "Vulnerability status: CONFIRMED\n",
+        )
+        original = report.read_bytes()
+
+        rendered_outputs = []
+        for show in (
+            self.show_findings_summary,
+            self.show_review_queue,
+            self.show_review_progress,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                show()
+            rendered_outputs.append(output.getvalue())
+
+        summary, queue, progress = rendered_outputs
+        for rendered in rendered_outputs:
+            for secret in (
+                "pw-secret", "query-secret", "key-secret", "title-secret",
+                "password-file-secret", "token-secret",
+            ):
+                self.assertNotIn(secret, rendered)
+            self.assertNotIn("\x1b", rendered)
+            self.assertNotIn("\u2028", rendered)
+            self.assertNotIn("legacy-password-file-secret", rendered)
+        self.assertIn("Content-Security-Policy", summary)
+        self.assertNotIn(
+            "Observed web security-header pattern: [MISSING] X-Forged-Header",
+            summary,
+        )
+        self.assertIn("UNCONFIRMED", summary)
+        self.assertNotIn("Vulnerability status: CONFIRMED", summary)
+        self.assertNotRegex(summary, r"(?m)^\s*Vulnerability status: CONFIRMED")
+        alias_matches = re.findall(r"@[A-Za-z0-9_-]+", queue)
+        self.assertTrue(alias_matches)
+        self.assertIn(alias_matches[0], progress)
+        alias_view = io.StringIO()
+        with contextlib.redirect_stdout(alias_view):
+            self.namespace["view_report"](alias_matches[0])
+        self.assertIn("Security Header Observations:", alias_view.getvalue())
+        self.assertEqual(report.read_bytes(), original)
+
+    def test_report_alias_mapping_cannot_resolve_outside_reports_directory(self):
+        report = self.write_report("inside.txt", "IN-ROOT REPORT\n")
+        outside = self.root / "outside-secret.txt"
+        outside.write_text("OUTSIDE SECRET CONTENT\n")
+        self.namespace["_REPORT_DISPLAY_ALIASES"]["@outside"] = outside.name
+
+        listing = io.StringIO()
+        with contextlib.redirect_stdout(listing):
+            self.namespace["list_reports"]()
+        viewed = io.StringIO()
+        with contextlib.redirect_stdout(viewed):
+            self.namespace["view_report"]("@outside")
+
+        self.assertNotIn("@outside", listing.getvalue())
+        self.assertNotIn("OUTSIDE SECRET CONTENT", viewed.getvalue())
+        self.assertIn("IN-ROOT REPORT", report.read_text())
+
     def test_review_queue_sorts_by_evidence_priority_without_promoting_status(self):
         self.write_report(
             "low.txt",
@@ -896,8 +1328,8 @@ Vulnerability status: UNCONFIRMED
 
         queue = self.build_review_queue(self.root / "reports")
 
-        self.assertLess(queue.index("high.txt"), queue.index("medium.txt"))
-        self.assertLess(queue.index("medium.txt"), queue.index("low.txt"))
+        self.assertLess(queue.index(self.report_alias("high.txt")), queue.index(self.report_alias("medium.txt")))
+        self.assertLess(queue.index(self.report_alias("medium.txt")), queue.index(self.report_alias("low.txt")))
         self.assertIn("account.php:8", queue)
         self.assertIn("account.php:21", queue)
         self.assertIn("Unresolved function call render", queue)
@@ -985,7 +1417,7 @@ Review status:
             "review-progress counts only outstanding reports.",
             queue,
         )
-        self.assertIn("reviewed_low.txt", queue)
+        self.assertIn(self.report_alias("reviewed_low.txt"), queue)
         self.assertIn("Reports with at least one valid review note: 1", progress)
         self.assertIn("Reports without review notes: 0", progress)
         self.assertIn("Low: 0", progress)
@@ -1001,7 +1433,7 @@ Unknown; no evidence was provided.
         )
         queue = self.build_review_queue(self.root / "reports")
 
-        self.assertIn("sparse.txt", queue)
+        self.assertIn(self.report_alias("sparse.txt"), queue)
         self.assertIn("Priority: Low", queue)
         self.assertIn("Source locations: Unknown", queue)
         self.assertIn("Sink locations: Unknown", queue)
@@ -1035,7 +1467,7 @@ Unknown; no evidence was provided.
 
         self.assertEqual(self.reviewable_report_names(reports), ["ordinary.txt"])
         self.assertIn("Saved reports read: 1", queue)
-        self.assertIn("ordinary.txt", queue)
+        self.assertIn(self.report_alias("ordinary.txt"), queue)
         self.assertNotIn("inside-link.txt", queue)
         self.assertNotIn("outside-link.txt", queue)
         self.assertNotIn("broken-link.txt", queue)
@@ -1082,6 +1514,207 @@ Unknown; no evidence was provided.
         )
         self.assertEqual(len(notes_path.read_text(encoding="utf-8").splitlines()), 2)
         self.assertEqual(report.read_bytes(), original)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("UNVERIFIED: 1", summary)
+        self.assertIn("VALIDATED: 0", summary)
+
+    def test_structured_validation_record_is_redacted_and_does_not_rewrite_report(self):
+        report = self.write_report(
+            "manual.txt",
+            "JARVIS POTENTIAL SECURITY FINDING\nVulnerability status: UNCONFIRMED\n",
+        )
+        original_report = report.read_bytes()
+        details = self.validation_details()
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = self.save_review_note(
+                self.root / "reports",
+                "manual.txt",
+                "Verified in authorized lab",
+                details["evidence"],
+                details["limitations"],
+                validation_status="VALIDATED",
+                validation_details=details,
+            )
+
+        self.assertEqual(note["validation_status"], "VALIDATED")
+        self.assertEqual(
+            note["validation_details"]["endpoint"],
+            "http://127.0.0.1/bWAPP/demo.php?token=%5BREDACTED%5D",
+        )
+        for secret in (
+            "synthetic-secret", "synthetic-bearer", "synthetic-session",
+            "synthetic-api-secret", "synthetic.user@example.test",
+        ):
+            self.assertNotIn(secret, json.dumps(note))
+        self.assertIn("[REDACTED]", note["validation_details"]["evidence"])
+        parsed, malformed, error = self.read_review_notes(self.root / "reports")
+        self.assertIsNone(error)
+        self.assertEqual(malformed, 0)
+        self.assertEqual(parsed[0]["validation_status"], "VALIDATED")
+
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("VALIDATED: 1", summary)
+        self.assertIn("UNVERIFIED: 0", summary)
+        self.assertIn("reviewer-reported, not authenticated by JARVIS", summary)
+        self.assertIn("manual.txt: UNCONFIRMED", summary)
+        self.assertEqual(report.read_bytes(), original_report)
+
+    def test_reviewer_text_redacts_sensitive_colon_and_equals_assignments(self):
+        sanitize = self.namespace["_sanitize_reviewer_text"]
+
+        result = sanitize(
+            "Cookie=secret_value\nAuthorization: Bearer another_secret\n"
+            "ordinary text remains"
+        )
+
+        self.assertNotIn("secret_value", result)
+        self.assertNotIn("another_secret", result)
+        self.assertIn("Cookie: [REDACTED]", result)
+        self.assertIn("Authorization: [REDACTED]", result)
+        self.assertIn("ordinary text remains", result)
+
+    def test_validated_status_rejects_incomplete_or_nonreproducible_records(self):
+        self.write_report("manual.txt", "Vulnerability status: UNCONFIRMED\n")
+        base = self.validation_details()
+        invalid_details = [
+            {**base, "evidence": "Unknown"},
+            {**base, "reproduction_steps": "1. Open the fixture."},
+            {**base, "actual_behavior": base["expected_behavior"]},
+            {**base, "severity_justification": "Not provided"},
+        ]
+        for details in invalid_details:
+            with self.subTest(details=details):
+                with self.assertRaises(ValueError):
+                    self.save_review_note(
+                        self.root / "reports", "manual.txt",
+                        "Verified in authorized lab", details["evidence"], details["limitations"],
+                        validation_status="VALIDATED", validation_details=details,
+                    )
+        self.assertFalse((self.root / "reports" / "review_notes" / "notes.jsonl").exists())
+
+    def test_validation_note_cli_records_manual_status_and_summary_without_network(self):
+        report = self.write_report("manual.txt", "Vulnerability status: UNCONFIRMED\n")
+        details = self.validation_details()
+        details["reproduction_steps"] = "1. Open the local fixture; 2. Submit the harmless value."
+        details["evidence"] = (
+            "Authorization: Bearer synthetic-bearer; Cookie: session=synthetic-session; "
+            "X-API-Key: synthetic-api-secret; Contact synthetic.user@example.test"
+        )
+        script = Path(__file__).resolve().parents[1] / "jarvis.py"
+        commands = ["validation-note", "1", "VALIDATED"]
+        commands.extend(details[field] for field in self.namespace["_VALIDATION_DETAIL_FIELDS"])
+        commands.extend(["summary", "review-notes", "manual.txt", "exit", "exit"])
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            input="\n".join(commands) + "\n",
+            text=True,
+            capture_output=True,
+            cwd=self.root,
+            check=True,
+        )
+        self.assertIn("Reviewer validation record appended", result.stdout)
+        self.assertIn("VALIDATED: 1", result.stdout)
+        self.assertIn("Report status:", result.stdout)
+        self.assertIn("UNCONFIRMED", result.stdout)
+        self.assertNotIn("Vulnerability status: CONFIRMED", result.stdout)
+        self.assertIn("Manual validation status (reviewer-reported; not authenticated by JARVIS): VALIDATED", result.stdout)
+        self.assertNotIn("synthetic-bearer", result.stdout)
+        self.assertNotIn("synthetic-session", result.stdout)
+        self.assertNotIn("synthetic-api-secret", result.stdout)
+        self.assertNotIn("synthetic.user@example.test", result.stdout)
+        self.assertIn("Vulnerability status: UNCONFIRMED", report.read_text())
+        self.assertTrue((self.root / "reports" / "review_notes" / "notes.jsonl").is_file())
+
+    def test_validation_status_transitions_and_summary_counts_are_conservative(self):
+        report = self.write_report("manual.txt", "Vulnerability status: UNCONFIRMED\n")
+        details = self.validation_details()
+        self.save_review_note(
+            self.root / "reports", "manual.txt", "Verified in authorized lab",
+            details["evidence"], details["limitations"],
+            validation_status="VALIDATED", validation_details=details,
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid validation status transition"):
+            self.save_review_note(
+                self.root / "reports", "manual.txt", "Needs more evidence",
+                "New result", "More testing needed", validation_status="FALSE_POSITIVE",
+                validation_details=self.validation_details(
+                    actual_behavior="The control behaves as expected.",
+                    evidence="The harmless fixture response was encoded.",
+                ),
+            )
+
+        self.save_review_note(
+            self.root / "reports", "manual.txt", "Needs more evidence",
+            "Assessment reopened", "A separate reproduction is required.",
+            validation_status="UNVERIFIED", validation_details=self.validation_details(),
+        )
+        false_positive = self.validation_details(
+            actual_behavior="The value is consistently encoded in the fixture.",
+            evidence="The apparent marker is inert text after parsing.",
+            limitations="Only the local fixture was inspected.",
+        )
+        self.save_review_note(
+            self.root / "reports", "manual.txt", "Needs more evidence",
+            false_positive["evidence"], false_positive["limitations"],
+            validation_status="FALSE_POSITIVE", validation_details=false_positive,
+        )
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("VALIDATED: 0", summary)
+        self.assertIn("UNVERIFIED: 0", summary)
+        self.assertIn("FALSE_POSITIVE: 1", summary)
+        self.assertIn("manual.txt: UNCONFIRMED", summary)
+        self.assertIn("Vulnerability status: UNCONFIRMED", report.read_text())
+
+        self.write_report("not-reproduced.txt", "Vulnerability status: UNCONFIRMED\n")
+        not_reproduced = self.validation_details(
+            actual_behavior="The observed behavior did not recur on the second local run.",
+            evidence="Two documented attempts produced the expected encoded result.",
+            limitations="Only the documented local fixture was retested.",
+        )
+        self.save_review_note(
+            self.root / "reports", "not-reproduced.txt", "Not reproduced",
+            not_reproduced["evidence"], not_reproduced["limitations"],
+            validation_status="NOT_REPRODUCIBLE", validation_details=not_reproduced,
+        )
+        self.write_report("observed.txt", "Vulnerability status: UNCONFIRMED\n")
+        observed = self.validation_details(
+            actual_behavior="An unusual but non-security-relevant response was observed.",
+            evidence="The local fixture returned its static demonstration page.",
+        )
+        self.save_review_note(
+            self.root / "reports", "observed.txt", "Needs more evidence",
+            observed["evidence"], observed["limitations"],
+            validation_status="OBSERVED", validation_details=observed,
+        )
+        self.write_report("unverified.txt", "Vulnerability status: UNCONFIRMED\n")
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("NOT_REPRODUCIBLE: 1", summary)
+        self.assertIn("OBSERVED: 1", summary)
+        self.assertIn("UNVERIFIED: 1", summary)
+
+    def test_malformed_structured_validation_note_is_skipped_conservatively(self):
+        self.write_report("manual.txt", "Vulnerability status: UNCONFIRMED\n")
+        notes_path = self.root / "reports" / "review_notes" / "notes.jsonl"
+        notes_path.parent.mkdir(parents=True)
+        malformed = {
+            "report_filename": "manual.txt",
+            "reviewed_at": "2026-10-12T12:00:00-04:00",
+            "reviewer_conclusion": "Verified in authorized lab",
+            "conclusion_attribution": "Reviewer-provided; not independently verified by JARVIS",
+            "supporting_evidence": "A claim without a complete validation record.",
+            "remaining_uncertainties": "Unknown",
+            "validation_status": "VALIDATED",
+            "validation_details": {"endpoint": "http://127.0.0.1/bWAPP/"},
+        }
+        notes_path.write_text(json.dumps(malformed) + "\n", encoding="utf-8")
+        notes, skipped, error = self.read_review_notes(self.root / "reports")
+        self.assertIsNone(error)
+        self.assertEqual(notes, [])
+        self.assertEqual(skipped, 1)
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("VALIDATED: 0", summary)
+        self.assertIn("UNVERIFIED: 1", summary)
+        self.assertIn("Malformed review-note records skipped: 1", summary)
 
     def test_review_note_rejects_invalid_selections_conclusions_and_blank_fields(self):
         self.write_report("manual.txt", "Vulnerability status: UNCONFIRMED\n")
@@ -1403,8 +2036,14 @@ Vulnerability status: UNCONFIRMED
         self.assertIn("Exact duplicate note records ignored: 1", progress)
         self.assertIn("Orphaned valid notes (report no longer present): 1", progress)
         self.assertIn("Reviewer conclusions are reviewer-provided notes, not automated vulnerability statuses.", progress)
-        self.assertLess(progress.index("High: a_high_open.txt"), progress.index("Low: d_low_open.txt"))
-        self.assertLess(progress.index("Low: d_low_open.txt"), progress.index("Unknown: e_unknown_open.txt"))
+        self.assertLess(
+            progress.index(f"High: {self.report_alias('a_high_open.txt')}"),
+            progress.index(f"Low: {self.report_alias('d_low_open.txt')}"),
+        )
+        self.assertLess(
+            progress.index(f"Low: {self.report_alias('d_low_open.txt')}"),
+            progress.index(f"Unknown: {self.report_alias('e_unknown_open.txt')}"),
+        )
         self.assertEqual({name: path.read_bytes() for name, path in report_paths.items()}, original_report_bytes)
         self.assertEqual(notes_path.read_bytes(), original_notes_bytes)
         self.assertTrue(all("Vulnerability status: UNCONFIRMED" in path.read_text() for path in report_paths.values() if path.name != "e_unknown_open.txt"))
@@ -1427,7 +2066,7 @@ Vulnerability status: UNCONFIRMED
         self.assertIn("Reports with at least one valid review note: 0", progress)
         self.assertIn("Reports without review notes: 1", progress)
         self.assertIn("Unknown: 1", progress)
-        self.assertIn("Unknown: unreviewed.txt", progress)
+        self.assertIn(f"Unknown: {self.report_alias('unreviewed.txt')}", progress)
 
     def test_review_progress_cli_is_read_only_and_available_in_help(self):
         report = self.write_report("tracker.txt", "Vulnerability status: UNCONFIRMED\n")
@@ -1480,6 +2119,23 @@ Vulnerability status: UNCONFIRMED
         self.assertIn("Evidence and confidence limitations:", report)
         self.assertIn("JARVIS has not independently validated", report)
 
+    def test_remediation_follows_finding_type_before_incidental_description_terms(self):
+        remediation = self.namespace["_report_remediation"]
+
+        reflected = remediation(
+            "Reflected XSS",
+            "The output expression includes text associated with an SQL query.",
+        )
+        self.assertIn("context-appropriate output encoding", reflected)
+        self.assertNotIn("parameterized queries", reflected)
+
+        sql_injection = remediation(
+            "SQL injection",
+            "The query result is later displayed in output.",
+        )
+        self.assertIn("parameterized queries", sql_injection)
+        self.assertNotIn("output encoding", sql_injection)
+
     def test_candidate_separates_observation_from_vulnerability_and_severity(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.record_candidate(
@@ -1495,18 +2151,67 @@ Vulnerability status: UNCONFIRMED
         report = report_path.read_text()
 
         self.assertIn("[+] Vulnerability candidate found", report)
-        self.assertIn("Title: Unverified security candidate", report)
-        self.assertIn("User-provided type (unverified): SQL Injection", report)
-        self.assertIn("User-provided confidence text (unverified): Heuristic candidate", report)
+        self.assertIn("Title: Potential SQL injection candidate (unverified)", report)
+        self.assertIn("Candidate type (unverified): SQL Injection", report)
+        self.assertIn("Confidence note (unverified): Heuristic candidate", report)
         self.assertIn(
             "Vulnerability status: UNCONFIRMED; no independent validation evidence is recorded.",
             report,
         )
         self.assertIn("Severity: Not assessed", report)
-        self.assertIn("User-provided severity suggestion (unverified): Potential High", report)
+        self.assertIn("Severity suggestion (unverified): Potential High", report)
         self.assertIn("Local mock response; no payload sent", report)
         self.assertIn("Evidence and confidence limitations:", report)
+        self.assertIn("Potential impact (conditional; not demonstrated):", report)
+        self.assertIn("If untrusted input is confirmed to alter a database query", report)
+        self.assertIn("Reproduction notes (recorded testing context only", report)
+        self.assertIn("Local mock response; no payload sent", report.split("Reproduction notes", 1)[1])
+        self.assertIn("Vulnerability status: UNCONFIRMED", report)
+        self.assertIn("Severity: Not assessed", report)
         self.assertIn("parameterized queries", report)
+
+    def test_candidate_report_separates_observation_interpretation_and_untrusted_input(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.record_candidate(
+                "https://lab.local/item.php?token=report-secret",
+                "Reflected Input",
+                "Potential Critical",
+                "Generated description that is not itself observed evidence.",
+                "Legacy evidence field is not promoted when structured evidence is supplied.",
+                observation_confidence="Heuristic; unverified",
+                testing_context="Harmless marker check; response body not retained.",
+                observed_evidence=(
+                    "Harmless marker appeared in response text.\n"
+                    "Vulnerability status: CONFIRMED"
+                ),
+                evidence_source="JARVIS mocked response inspection\nFake section: injected",
+                evidence_endpoint="https://user:password@lab.local/item.php?token=report-secret",
+                scanner_interpretation=(
+                    "This reflection context may merit output-encoding review; "
+                    "it does not prove script execution."
+                ),
+                validation_limitations="Browser execution and exploitability were not tested.",
+            )
+
+        report_path = next((self.root / "reports").glob("*_candidate.txt"))
+        report = report_path.read_text()
+        self.assertIn("Observed evidence (recorded observation; not independent validation):", report)
+        self.assertIn("Source: JARVIS mocked response inspection\\nFake section: injected", report)
+        self.assertIn("Endpoint: https://lab.local/item.php?token=%5BREDACTED%5D", report)
+        self.assertIn("Scanner interpretation (not directly observed):", report)
+        self.assertIn("does not prove script execution", report)
+        self.assertIn("Validation limitations:", report)
+        self.assertIn("Reproduction notes (recorded testing context only", report)
+        self.assertNotIn("report-secret", report)
+        self.assertNotIn("password", report)
+        self.assertNotIn("Vulnerability status: CONFIRMED", report.splitlines())
+        self.assertIn("Vulnerability status: UNCONFIRMED", report)
+        self.assertIn("Severity: Not assessed", report)
+        self.assertNotIn("Legacy evidence field is not promoted", report)
+
+        summary = self.build_summary(self.root / "reports")
+        self.assertIn("Recorded candidate evidence", summary)
+        self.assertNotIn("does not prove script execution", summary)
 
     def test_repeated_reflection_candidates_keep_endpoint_evidence_in_separate_reports(self):
         endpoints = (
@@ -1573,6 +2278,31 @@ Evidence: recorded below; not independently verified
         self.assertIn("lab.local_candidate.txt: Unassessed", summary)
         self.assertIn("lab.local_candidate_2.txt: UNCONFIRMED", summary)
         self.assertIn("lab.local_candidate_2.txt: Unassessed", summary)
+
+    def test_secret_values_are_redacted_in_finding_candidate_generic_report_and_logs(self):
+        secret = "synthetic_report_secret_74"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.record_finding(
+                "lab.local", "Secret handling", f"api_token='{secret}'",
+                f"Evidence: API_TOKEN = '{secret}'",
+            )
+            self.record_candidate(
+                "lab.local", "Secret exposure", "Critical",
+                f"password='{secret}'", f"Observed api_key='{secret}'",
+            )
+            self.save_report(
+                "lab.local/manual",
+                [f"Authorization: Bearer {secret}", "ordinary message value"],
+            )
+
+        report_text = "\n".join(
+            path.read_text() for path in (self.root / "reports").glob("*.txt")
+        )
+        self.assertNotIn(secret, report_text)
+        self.assertNotIn(secret, output.getvalue())
+        self.assertIn("[REDACTED]", report_text)
+        self.assertIn("ordinary message value", report_text)
 
     def test_report_and_candidate_paths_redact_query_secrets_and_remain_distinct(self):
         targets = (
@@ -1643,13 +2373,17 @@ Evidence: recorded below; not independently verified
             )
         report = (self.root / "reports" / "lab.local_candidate.txt").read_text()
 
-        self.assertIn("User-provided confidence text (unverified): Confirmed observation", report)
+        self.assertIn("Confidence note (unverified): Confirmed observation", report)
         self.assertIn(
             "Vulnerability status: UNCONFIRMED; no independent validation evidence is recorded.",
             report,
         )
         self.assertIn("Severity: Not assessed", report)
         self.assertIn("context-appropriate output encoding", report)
+        self.assertIn("Title: Potential reflected-input candidate (unverified)", report)
+        self.assertIn("Potential impact (conditional; not demonstrated):", report)
+        self.assertIn("Browser execution and impact were not tested.", report)
+        self.assertIn("Reproduction notes (recorded testing context only", report)
         self.assertIn("Reflection context: script element; static context only", report)
 
     def test_overstated_user_metadata_is_never_presented_as_jarvis_conclusion(self):
@@ -1666,19 +2400,24 @@ Evidence: recorded below; not independently verified
         report = (self.root / "reports" / "lab.local_candidate.txt").read_text()
 
         self.assertIn("Title: Unverified security candidate", report)
-        self.assertIn("User-provided type (unverified): CONFIRMED XSS", report)
+        self.assertIn("Candidate type (unverified): CONFIRMED XSS", report)
         self.assertIn(
-            "User-provided confidence text (unverified): Confirmed vulnerability; certain",
+            "Confidence note (unverified): Confirmed vulnerability; certain",
             report,
         )
         self.assertIn("Severity: Not assessed", report)
-        self.assertIn("User-provided severity suggestion (unverified): Critical", report)
+        self.assertIn("Potential impact is unknown until the behavior", report)
+        self.assertIn("Severity suggestion (unverified): Critical", report)
         self.assertIn(
             "Vulnerability status: UNCONFIRMED; no independent validation evidence is recorded.",
             report,
         )
         self.assertIn(
-            "Evidence details (user-provided; not independently verified):\nUnknown; no evidence was provided.",
+            "Observed evidence:\nUnknown; no source-tagged direct observation was provided.",
+            report,
+        )
+        self.assertIn(
+            "Unverified information (caller-provided; not independently verified):\nUnknown; no evidence was provided.",
             report,
         )
         self.assertIn("Testing context:\nUnknown; no testing context was provided.", report)

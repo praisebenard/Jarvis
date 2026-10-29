@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-The application currently lives in the root-level `jarvis.py`. It provides an interactive security-review CLI, including web target checks and PHP source inspection. `scope.txt` lists authorized target hostnames, one per line; lines beginning with `#` are ignored. Generated text reports are stored in `reports/`. `jarvis.py.backup` is a historical copy, not the active entry point. There is no separate source package, asset directory, or test suite in this checkout.
+The application currently lives in the root-level `jarvis.py`. It provides an interactive security-review CLI, including web target checks and PHP source inspection. `scope.txt` lists authorized target hostnames, one per line; lines beginning with `#` are ignored. Generated text reports are stored in `reports/`. `jarvis.py.backup` is a historical copy, not the active entry point. Tests live in `tests/` and use Python's standard `unittest` framework; there is no separate source package or asset directory.
 
 ## Build, Test, and Development Commands
 
@@ -10,6 +10,7 @@ This repository has no build system or declared dependency manifest. Use the exi
 
 - `source .venv/bin/activate` activates the local Python environment.
 - `python jarvis.py` starts the interactive CLI; enter `help` to see commands and `exit` to quit.
+- `python -m unittest discover -s tests` runs the automated test suite.
 - `python -m py_compile jarvis.py` checks Python syntax without running the interactive program.
 
 The application imports `requests`; install it in your environment if it is missing. Runtime files such as `scope.txt` and `reports/` are resolved relative to the current working directory.
@@ -20,7 +21,7 @@ Use Python 3, four spaces per indentation level, `snake_case` for functions and 
 
 ## Testing Guidelines
 
-No automated test framework or coverage target is configured. For behavior changes, manually exercise the relevant CLI command using a local fixture or explicitly authorized target. Keep security checks inside the scope configured in `scope.txt`; do not use an unapproved external host as a test target.
+The suite uses `unittest`; no coverage target is configured. For behavior changes, run relevant tests and manually exercise the CLI with a local fixture where appropriate. Keep security checks inside the scope configured in `scope.txt`; do not use an unapproved external host as a test target.
 
 ## Commit & Pull Request Guidelines
 
