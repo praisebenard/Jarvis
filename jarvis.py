@@ -1370,6 +1370,370 @@ def scan_directories(base_url, enabled=False, budget_state=None):
 
     return findings
 
+
+
+# ---------------------------------------------------------------------------
+# SQL injection — time-based blind detection (active)
+# ---------------------------------------------------------------------------
+
+# Payloads for different database backends.
+# Each tuple: (label, payload, expected_delay_seconds)
+# We inject into the parameter value and measure response time.
+_SQLI_TIME_PAYLOADS = [
+    # MySQL / MariaDB
+    ("MySQL SLEEP",          "' AND SLEEP(5)-- -",          5),
+    ("MySQL SLEEP (double)", "\" AND SLEEP(5)-- -",         5),
+    # PostgreSQL
+    ("PostgreSQL pg_sleep",  "' AND 1=(SELECT 1 FROM pg_sleep(5))-- -", 5),
+    # MSSQL
+    ("MSSQL WAITFOR",        "'; WAITFOR DELAY '0:0:5'-- -", 5),
+    # SQLite
+    ("SQLite heavy query",   "' AND 1=1 AND (SELECT COUNT(*) FROM sqlite_master)>0-- -", 2),
+    # Generic boolean (no delay — checks for error-based signals)
+    ("Generic quote",        "'",                           0),
+]
+
+# Error strings that indicate SQL injection regardless of timing
+_SQLI_ERROR_SIGNALS = [
+    "sql syntax", "mysql_fetch", "ora-", "pg_query", "sqlite_",
+    "syntax error", "unclosed quotation", "sqlexception",
+    "odbc driver", "jdbc", "microsoft ole db",
+    "you have an error in your sql syntax",
+    "warning: mysql", "division by zero",
+    "supplied argument is not a valid mysql",
+]
+
+# How many standard deviations above baseline = suspicious delay
+_SQLI_DELAY_MULTIPLIER = 0.8   # response must be >= payload_delay * this
+
+
+def _sqli_baseline_time(url, parameter):
+    """
+    Fetch the URL with the original parameter value twice and return
+    the average response time as a baseline.
+    """
+    times = []
+    for _ in range(2):
+        try:
+            t0 = time.monotonic()
+            resp = scoped_get(
+                url,
+                timeout=15,
+                allow_redirects=True,
+                headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+            )
+            elapsed = time.monotonic() - t0
+            times.append(elapsed)
+            resp.close()
+        except requests.RequestException:
+            times.append(0.0)
+    return sum(times) / len(times) if times else 0.0
+
+
+def check_sqli(url, parameter, enabled=False, budget_state=None):
+    """
+    Test `parameter` for time-based and error-based SQL injection.
+
+    Strategy:
+      1. Measure baseline response time (2 requests).
+      2. For each time-based payload, inject and measure response time.
+         If response >= (expected_delay * multiplier) + baseline → signal.
+      3. For error-based payloads, check response body for SQL error strings.
+
+    Only runs when enabled=True (--active opt-in required).
+    Returns True if any signal was observed.
+    """
+    if not enabled:
+        return False
+
+    safe_param = _safe_report_parameter_name(parameter)
+    found = False
+
+    # Measure baseline
+    try:
+        baseline = _sqli_baseline_time(url, parameter)
+        if budget_state is not None:
+            budget_state["used"] = budget_state.get("used", 0) + 2
+    except Exception:
+        baseline = 0.5
+
+    for label, payload, expected_delay in _SQLI_TIME_PAYLOADS:
+        # Budget check
+        if budget_state is not None:
+            if budget_state.get("exhausted") or budget_state["used"] >= budget_state["limit"]:
+                budget_state["exhausted"] = True
+                print(f"  [STOPPED] Budget exhausted during SQLi check on '{safe_param}'.")
+                break
+
+        # Build probe URL — preserve all other params
+        parsed = urlsplit(url)
+        query_items = parsed.query.split("&") if parsed.query else []
+        updated = []
+        replaced = False
+        for item in query_items:
+            name, sep, value = item.partition("=")
+            if name == parameter:
+                updated.append(f"{name}={quote(payload, safe='')}")
+                replaced = True
+            else:
+                updated.append(item)
+        if not replaced:
+            updated.append(f"{parameter}={quote(payload, safe='')}")
+
+        probe_url = urlunsplit((
+            parsed.scheme, parsed.netloc, parsed.path,
+            "&".join(updated), "",
+        ))
+
+        try:
+            # Rate limiting
+            if budget_state is not None and budget_state.get("last_request_at"):
+                elapsed = time.monotonic() - budget_state["last_request_at"]
+                interval = budget_state.get("minimum_interval", 0.25)
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+            timeout = max(expected_delay + 10, 15)
+            t0 = time.monotonic()
+            resp = scoped_get(
+                probe_url,
+                timeout=timeout,
+                allow_redirects=True,
+                headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+            )
+            elapsed = time.monotonic() - t0
+
+            if budget_state is not None:
+                budget_state["used"] = budget_state.get("used", 0) + 1
+                budget_state["last_request_at"] = time.monotonic()
+
+            try:
+                body_lower = resp.text[:8192].lower()
+
+                # Time-based detection
+                if expected_delay > 0:
+                    threshold = baseline + (expected_delay * _SQLI_DELAY_MULTIPLIER)
+                    if elapsed >= threshold:
+                        print(
+                            f"  [POTENTIAL SQLi] '{safe_param}' — {label}: "
+                            f"response took {elapsed:.1f}s "
+                            f"(baseline {baseline:.1f}s, expected delay {expected_delay}s)"
+                        )
+                        record_candidate(
+                            url,
+                            "SQL Injection (Time-Based)",
+                            "High",
+                            (
+                                f"Parameter '{parameter}' caused a significant response delay "
+                                f"when injected with a time-based SQLi payload ({label})."
+                            ),
+                            (
+                                f"Parameter: {parameter}\n"
+                                f"Payload: {payload}\n"
+                                f"Test URL: {_render_report_endpoint(probe_url)}\n"
+                                f"Baseline response time: {baseline:.2f}s\n"
+                                f"Probe response time: {elapsed:.2f}s\n"
+                                f"Expected delay: {expected_delay}s\n"
+                                "A response significantly slower than baseline after "
+                                "injecting a time-delay payload is a strong signal of "
+                                "SQL injection. Manual verification is required."
+                            ),
+                            observation_confidence=(
+                                "Heuristic candidate: time-delay signal observed"
+                            ),
+                            testing_context=(
+                                f"GET parameter: {parameter}; "
+                                f"time-based SQLi payload injected ({label}); "
+                                "response time compared to baseline."
+                            ),
+                            observed_evidence=(
+                                f"Baseline: {baseline:.2f}s\n"
+                                f"Probe: {elapsed:.2f}s\n"
+                                f"Payload: {payload}"
+                            ),
+                            evidence_source="JARVIS active SQLi time-based probe",
+                            evidence_endpoint=resp.url,
+                            scanner_interpretation=(
+                                f"Response time {elapsed:.1f}s exceeds threshold of "
+                                f"{threshold:.1f}s (baseline + {_SQLI_DELAY_MULTIPLIER*100:.0f}% "
+                                f"of expected delay). Network jitter can cause false positives; "
+                                "repeat manually to confirm."
+                            ),
+                            validation_limitations=(
+                                "Timing-based detection is probabilistic. "
+                                "Network latency can cause false positives. "
+                                "Exploitability and data access were not assessed."
+                            ),
+                            structured_test_result={
+                                "schema_version": 1,
+                                "method": "scoped_get",
+                                "test_type": "sqli_time_based",
+                                "observation": "delay_signal",
+                                "payload": payload,
+                                "baseline_seconds": round(baseline, 3),
+                                "probe_seconds": round(elapsed, 3),
+                                "expected_delay": expected_delay,
+                                "requested_endpoint": probe_url,
+                                "final_response_endpoint": resp.url,
+                                "response_origin": "fresh",
+                                "evidence_completeness": "partial",
+                                "not_established": [
+                                    "confirmed_sql_injection",
+                                    "data_access",
+                                    "impact",
+                                ],
+                            },
+                        )
+                        found = True
+                        break   # one confirmed signal per parameter is enough
+                    else:
+                        print(
+                            f"  [OK] '{safe_param}' — {label}: "
+                            f"{elapsed:.1f}s (baseline {baseline:.1f}s)"
+                        )
+
+                # Error-based detection (for generic quote payload)
+                else:
+                    error_hit = next(
+                        (s for s in _SQLI_ERROR_SIGNALS if s in body_lower),
+                        None,
+                    )
+                    if error_hit:
+                        print(
+                            f"  [POTENTIAL SQLi] '{safe_param}' — error signal: "
+                            f"'{error_hit}' in response body"
+                        )
+                        record_candidate(
+                            url,
+                            "SQL Injection (Error-Based)",
+                            "High",
+                            (
+                                f"Parameter '{parameter}' returned a SQL error string "
+                                f"when injected with a single quote."
+                            ),
+                            (
+                                f"Parameter: {parameter}\n"
+                                f"Payload: {payload}\n"
+                                f"Test URL: {_render_report_endpoint(probe_url)}\n"
+                                f"Error signal found: '{error_hit}'\n"
+                                "A SQL error in the response body after injecting a "
+                                "quote character is a strong signal of SQL injection."
+                            ),
+                            observation_confidence=(
+                                "Heuristic candidate: SQL error string in response"
+                            ),
+                            testing_context=(
+                                f"GET parameter: {parameter}; "
+                                "single-quote injected; response body scanned for SQL errors."
+                            ),
+                            observed_evidence=(
+                                f"Error signal: '{error_hit}'\n"
+                                f"Payload: {payload}\n"
+                                f"HTTP status: {resp.status_code}"
+                            ),
+                            evidence_source="JARVIS active SQLi error-based probe",
+                            evidence_endpoint=resp.url,
+                            scanner_interpretation=(
+                                f"The string '{error_hit}' appeared in the response body "
+                                "after a single-quote injection. This suggests the input "
+                                "is being passed unsanitized to a SQL query."
+                            ),
+                            validation_limitations=(
+                                "Error strings can appear in page content unrelated to SQL. "
+                                "Manual verification is required."
+                            ),
+                            structured_test_result={
+                                "schema_version": 1,
+                                "method": "scoped_get",
+                                "test_type": "sqli_error_based",
+                                "observation": "error_signal",
+                                "payload": payload,
+                                "error_signal": error_hit,
+                                "requested_endpoint": probe_url,
+                                "final_response_endpoint": resp.url,
+                                "response_origin": "fresh",
+                                "evidence_completeness": "partial",
+                                "not_established": [
+                                    "confirmed_sql_injection",
+                                    "data_access",
+                                    "impact",
+                                ],
+                            },
+                        )
+                        found = True
+                        break
+                    else:
+                        print(f"  [OK] '{safe_param}' — no SQL error signals in response.")
+
+            finally:
+                resp.close()
+
+        except requests.exceptions.Timeout:
+            if budget_state is not None:
+                budget_state["used"] = budget_state.get("used", 0) + 1
+            # Timeout on a time-based payload is itself a signal
+            if expected_delay > 0:
+                print(
+                    f"  [POTENTIAL SQLi] '{safe_param}' — {label}: "
+                    f"request timed out (possible blind time-based SQLi)"
+                )
+                record_candidate(
+                    url,
+                    "SQL Injection (Time-Based — Timeout)",
+                    "High",
+                    (
+                        f"Parameter '{parameter}' caused a request timeout "
+                        f"when injected with a time-based SQLi payload ({label}). "
+                        "This may indicate blind SQL injection."
+                    ),
+                    (
+                        f"Parameter: {parameter}\n"
+                        f"Payload: {payload}\n"
+                        f"Test URL: {_render_report_endpoint(probe_url)}\n"
+                        f"Baseline response time: {baseline:.2f}s\n"
+                        "Request timed out — the server may be executing the SLEEP/WAITFOR.\n"
+                        "Manual verification required."
+                    ),
+                    observation_confidence=(
+                        "Heuristic candidate: request timeout on time-delay payload"
+                    ),
+                    testing_context=(
+                        f"GET parameter: {parameter}; time-based payload caused timeout."
+                    ),
+                    observed_evidence=(
+                        f"Timeout after {timeout}s\nPayload: {payload}"
+                    ),
+                    evidence_source="JARVIS active SQLi time-based probe",
+                    evidence_endpoint=probe_url,
+                    scanner_interpretation=(
+                        "A timeout on a time-delay payload is a possible blind SQLi signal. "
+                        "Network issues can also cause timeouts; repeat manually."
+                    ),
+                    validation_limitations=(
+                        "Timeout is not conclusive. Verify manually with Burp Suite or sqlmap."
+                    ),
+                    structured_test_result={
+                        "schema_version": 1,
+                        "method": "scoped_get",
+                        "test_type": "sqli_time_based",
+                        "observation": "timeout",
+                        "payload": payload,
+                        "requested_endpoint": probe_url,
+                        "response_origin": "fresh",
+                        "evidence_completeness": "partial",
+                        "not_established": ["confirmed_sql_injection", "impact"],
+                    },
+                )
+                found = True
+                break
+
+        except requests.RequestException as e:
+            if budget_state is not None and budget_state.get("exhausted"):
+                raise
+            print(f"  [ERROR] SQLi probe failed for '{safe_param}': {type(e).__name__}")
+
+    return found
+
 def crawl_local_pages(
     start_url, max_pages=50, response_cache=None, initial_response=None,
     coverage_issues=None,
@@ -1903,6 +2267,34 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
         else:
             print("Directory Scan: skipped (use --active to enable)")
             report.append("Directory Scan: skipped; --active opt-in required.")
+        print()
+        report.append("")
+        # --- SQL injection time-based detection (active) ---
+        if active_checks:
+            print()
+            print("SQL Injection Checks (active):")
+            report.append("SQL Injection Checks:")
+            _sqli_params = [
+                item for item in parameters
+                if item["method"] == "GET"
+            ]
+            if _sqli_params:
+                for _sq in _sqli_params:
+                    _hit = check_sqli(
+                        _sq["url"], _sq["name"],
+                        enabled=True,
+                        budget_state=budget_state,
+                    )
+                    if _hit:
+                        report.append(f"  [SIGNAL] SQLi signal on '{_safe_report_parameter_name(_sq['name'])}'")
+                    else:
+                        report.append(f"  [OK] '{_safe_report_parameter_name(_sq['name'])}': no SQLi signal")
+            else:
+                print("  No GET parameters to test.")
+                report.append("  No GET parameters to test.")
+        else:
+            print("SQL Injection Checks: skipped (use --active to enable)")
+            report.append("SQL Injection Checks: skipped; --active opt-in required.")
         print()
         report.append("")
 
