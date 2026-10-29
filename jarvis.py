@@ -2019,6 +2019,182 @@ def audit_js_files(response, budget_state=None):
 
     return {"secrets": all_secrets, "endpoints": all_endpoints}
 
+
+
+# ---------------------------------------------------------------------------
+# Subdomain enumeration (active)
+# ---------------------------------------------------------------------------
+
+import socket
+
+# Common subdomains to probe — ordered by likelihood of finding something
+_SUBDOMAIN_WORDLIST = [
+    # Core infrastructure
+    "www", "mail", "email", "smtp", "pop", "imap", "ftp",
+    # Development / staging
+    "dev", "development", "staging", "stage", "stg", "uat",
+    "test", "testing", "qa", "beta", "alpha", "demo", "sandbox",
+    "preview", "preprod", "pre-prod", "old", "legacy",
+    # APIs
+    "api", "api2", "api3", "apiv1", "apiv2", "rest", "graphql",
+    "services", "service", "ws", "websocket",
+    # Admin / management
+    "admin", "administrator", "manage", "management", "panel",
+    "dashboard", "control", "portal", "staff", "internal",
+    "intranet", "office", "hub",
+    # Auth
+    "auth", "login", "sso", "oauth", "identity", "account",
+    "accounts", "signin", "signup", "register", "pass", "password",
+    # Infrastructure
+    "cdn", "static", "assets", "media", "images", "img",
+    "uploads", "files", "storage", "backup", "backups",
+    "db", "database", "mysql", "postgres", "redis", "cache",
+    # Monitoring / ops
+    "monitor", "monitoring", "status", "uptime", "health",
+    "metrics", "logs", "logging", "grafana", "kibana",
+    "jenkins", "ci", "gitlab", "git", "repo", "build",
+    # Apps / products
+    "app", "apps", "mobile", "web", "shop", "store", "pay",
+    "payment", "checkout", "billing", "support", "help", "docs",
+    "documentation", "wiki", "kb", "blog", "news", "forum",
+    "community", "chat", "vpn", "remote", "crm", "erp",
+    # Extras
+    "new", "next", "v2", "v3", "secure", "ssl", "m",
+]
+
+
+def enumerate_subdomains(target, enabled=False):
+    """
+    Probe common subdomains of `target` by DNS resolution.
+
+    Uses socket.getaddrinfo — no HTTP requests needed.
+    If a subdomain resolves, it is flagged for manual review.
+    Optionally probes HTTP/HTTPS to check if it responds.
+
+    Only runs when enabled=True (--active opt-in required).
+    Returns list of found subdomain dicts.
+    """
+    if not enabled:
+        return []
+
+    # Extract base domain from target
+    parsed  = urlsplit(target if "://" in target else "https://" + target)
+    host    = parsed.hostname or target
+    # Strip leading www.
+    if host.startswith("www."):
+        host = host[4:]
+
+    found = []
+    print(f"Subdomain Enumeration: probing {len(_SUBDOMAIN_WORDLIST)} subdomains of {host}")
+
+    for sub in _SUBDOMAIN_WORDLIST:
+        fqdn = f"{sub}.{host}"
+        try:
+            results = socket.getaddrinfo(fqdn, None, proto=socket.IPPROTO_TCP)
+            if results:
+                ip = results[0][4][0]
+
+                # Quick HTTP probe to see if it responds
+                http_status  = None
+                https_status = None
+
+                for scheme, port in [("https", 443), ("http", 80)]:
+                    try:
+                        resp = requests.get(
+                            f"{scheme}://{fqdn}/",
+                            timeout=5,
+                            allow_redirects=False,
+                            headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+                        )
+                        if scheme == "https":
+                            https_status = resp.status_code
+                        else:
+                            http_status = resp.status_code
+                        resp.close()
+                        break   # got a response, no need to try both
+                    except requests.RequestException:
+                        pass
+
+                status_note = ""
+                if https_status is not None:
+                    status_note = f"HTTPS {https_status}"
+                elif http_status is not None:
+                    status_note = f"HTTP {http_status}"
+                else:
+                    status_note = "DNS resolves (no HTTP response)"
+
+                print(f"  [FOUND] {fqdn} → {ip}  {status_note}")
+
+                found.append({
+                    "subdomain": fqdn,
+                    "ip":        ip,
+                    "status":    status_note,
+                })
+
+                record_candidate(
+                    target,
+                    "Subdomain Discovered",
+                    "Info",
+                    (
+                        f"Subdomain '{fqdn}' resolves to {ip}. "
+                        "It may be in scope and worth auditing separately."
+                    ),
+                    (
+                        f"Subdomain: {fqdn}\n"
+                        f"IP: {ip}\n"
+                        f"HTTP probe: {status_note}\n"
+                        "Check whether this subdomain is in your HackerOne program scope "
+                        "before testing it. Subdomains like dev/staging/admin often have "
+                        "weaker security controls."
+                    ),
+                    observation_confidence=(
+                        "Confirmed observation: DNS resolution successful"
+                    ),
+                    testing_context=(
+                        f"DNS resolution via socket.getaddrinfo for {fqdn}; "
+                        "optional HTTP probe to check responsiveness."
+                    ),
+                    observed_evidence=(
+                        f"DNS resolved: {fqdn} → {ip}\n"
+                        f"HTTP probe result: {status_note}"
+                    ),
+                    evidence_source="JARVIS subdomain enumeration",
+                    evidence_endpoint=f"https://{fqdn}/",
+                    scanner_interpretation=(
+                        f"The subdomain {fqdn} is live. "
+                        "Audit it with 'audit " + fqdn + " --active' after confirming scope."
+                    ),
+                    validation_limitations=(
+                        "DNS resolution confirms the subdomain exists but does not "
+                        "confirm it is in scope. Verify scope before testing."
+                    ),
+                    structured_test_result={
+                        "schema_version": 1,
+                        "method": "dns_resolution",
+                        "test_type": "subdomain_enumeration",
+                        "observation": "dns_resolves",
+                        "subdomain": fqdn,
+                        "ip": ip,
+                        "http_probe": status_note,
+                        "response_origin": "fresh",
+                        "evidence_completeness": "partial",
+                        "not_established": ["in_scope", "exploitability"],
+                    },
+                )
+
+        except (socket.gaierror, socket.herror):
+            # Does not resolve — skip silently
+            pass
+        except Exception:
+            pass
+
+    if found:
+        print(f"  {len(found)} subdomain(s) found — check scope before testing.")
+    else:
+        print("  No subdomains found.")
+
+    return found
+
 def crawl_local_pages(
     start_url, max_pages=50, response_cache=None, initial_response=None,
     coverage_issues=None,
@@ -2597,6 +2773,23 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
             report.append("  Endpoints in JS:")
             for _e in _js_results["endpoints"]:
                 report.append(f"    {_e['path']}  (from {_e['source']})")
+        print()
+        report.append("")
+        # --- Subdomain enumeration (active) ---
+        if active_checks:
+            print()
+            print("Subdomain Enumeration (active):")
+            report.append("Subdomain Enumeration:")
+            _sub_results = enumerate_subdomains(url, enabled=True)
+            if _sub_results:
+                for _sub in _sub_results:
+                    report.append(f"  [FOUND] {_sub['subdomain']} -> {_sub['ip']}  {_sub['status']}")
+                report.append("  Verify scope before auditing any subdomain.")
+            else:
+                report.append("  No subdomains found.")
+        else:
+            print("Subdomain Enumeration: skipped (use --active to enable)")
+            report.append("Subdomain Enumeration: skipped; --active opt-in required.")
         print()
         report.append("")
 
