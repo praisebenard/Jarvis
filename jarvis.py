@@ -1174,6 +1174,202 @@ def check_cookies(response):
 
     return results
 
+
+
+# ---------------------------------------------------------------------------
+# Directory / path discovery (active)
+# ---------------------------------------------------------------------------
+
+_DIR_WORDLIST = [
+    # Admin / management
+    "admin", "administrator", "admin/login", "admin/dashboard",
+    "manager", "management", "staff", "superuser", "root",
+    # APIs
+    "api", "api/v1", "api/v2", "api/v3", "api/users", "api/admin",
+    "graphql", "rest", "swagger", "swagger-ui", "swagger.json",
+    "openapi.json", "api-docs",
+    # Auth
+    "login", "logout", "signin", "signup", "register",
+    "auth", "oauth", "sso", "forgot-password", "reset-password",
+    # Config / secrets
+    ".env", ".env.local", ".env.backup", ".env.prod",
+    "config.php", "config.yml", "config.json", "settings.py",
+    "database.yml", "secrets.yml", "credentials.json",
+    # Exposed source
+    ".git", ".git/config", ".git/HEAD", ".svn", ".svn/entries",
+    ".htaccess", ".htpasswd", "web.config",
+    # Backups
+    "backup", "backup.zip", "backup.tar.gz", "backup.sql",
+    "db.sql", "dump.sql", "database.sql",
+    "site.zip", "www.zip", "files.zip",
+    # Debug / info
+    "phpinfo.php", "info.php", "test.php", "debug",
+    "server-status", "server-info", "status", "health",
+    "robots.txt", "sitemap.xml", "security.txt", ".well-known/security.txt",
+    # Common panels
+    "phpmyadmin", "pma", "cpanel", "webmail", "wp-admin",
+    "wp-login.php", "xmlrpc.php", "joomla", "drupal",
+    # Upload / files
+    "upload", "uploads", "files", "static", "assets",
+    "media", "images", "docs", "documents",
+    # Internal
+    "internal", "intranet", "private", "secret", "hidden",
+    "staging", "dev", "development", "test", "beta",
+    "old", "bak", "archive",
+]
+
+# Status codes that mean "something is here"
+_INTERESTING_CODES = {200, 201, 301, 302, 303, 307, 401, 403, 405}
+
+
+def scan_directories(base_url, enabled=False, budget_state=None):
+    """
+    Probe common paths on base_url for interesting responses.
+
+    Only runs when enabled=True (--active opt-in required).
+    Respects the audit request budget.
+    Returns list of finding dicts.
+    """
+    if not enabled:
+        return []
+
+    # Strip to base (scheme + host)
+    parsed = urlsplit(base_url)
+    base = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+    findings = []
+    print(f"Directory Scan: ({len(_DIR_WORDLIST)} paths)")
+
+    for path in _DIR_WORDLIST:
+        # Check budget
+        if budget_state is not None:
+            if budget_state["exhausted"]:
+                print("  [STOPPED] Request budget exhausted during directory scan.")
+                break
+            if budget_state["used"] >= budget_state["limit"]:
+                budget_state["exhausted"] = True
+                print("  [STOPPED] Request budget exhausted during directory scan.")
+                break
+
+        url = f"{base}/{path}"
+
+        try:
+            # Rate limiting
+            if budget_state is not None and budget_state.get("last_request_at"):
+                elapsed = time.monotonic() - budget_state["last_request_at"]
+                interval = budget_state.get("minimum_interval", 0.25)
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+            resp = session.get(
+                url,
+                timeout=8,
+                allow_redirects=False,
+                headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+            )
+
+            if budget_state is not None:
+                budget_state["used"] += 1
+                budget_state["last_request_at"] = time.monotonic()
+
+            code = resp.status_code
+
+            if code in _INTERESTING_CODES:
+                # Classify severity
+                if path in (".git", ".git/config", ".git/HEAD", ".env",
+                            ".env.local", ".env.backup", ".env.prod",
+                            ".htpasswd", "credentials.json", "secrets.yml",
+                            "backup.sql", "db.sql", "dump.sql", "database.sql"):
+                    severity = "High"
+                elif code in (200, 401) and "admin" in path.lower():
+                    severity = "Medium"
+                elif code == 403:
+                    severity = "Info"
+                else:
+                    severity = "Low"
+
+                redirect_to = resp.headers.get("Location", "")
+                note = f" → {redirect_to}" if redirect_to else ""
+                print(f"  [{code}] {severity:6s} /{path}{note}")
+
+                findings.append({
+                    "path":     path,
+                    "url":      url,
+                    "status":   code,
+                    "severity": severity,
+                    "redirect": redirect_to,
+                })
+
+                # Record as candidate for non-info findings
+                if severity != "Info":
+                    evidence = (
+                        f"Path: /{path}\n"
+                        f"Full URL: {url}\n"
+                        f"HTTP status: {code}\n"
+                    )
+                    if redirect_to:
+                        evidence += f"Redirects to: {redirect_to}\n"
+
+                    record_candidate(
+                        base_url,
+                        "Exposed Path",
+                        severity,
+                        (
+                            f"Path '/{path}' returned HTTP {code}. "
+                            "This may indicate an exposed sensitive resource."
+                        ),
+                        evidence,
+                        observation_confidence=(
+                            f"Confirmed observation: HTTP {code} response received"
+                        ),
+                        testing_context=(
+                            f"Active directory scan; GET request to /{path}; "
+                            "allow_redirects=False."
+                        ),
+                        observed_evidence=(
+                            f"HTTP {code} from {url}"
+                            + (f"; Location: {redirect_to}" if redirect_to else "")
+                        ),
+                        evidence_source="JARVIS active directory scan",
+                        evidence_endpoint=url,
+                        scanner_interpretation=(
+                            f"HTTP {code} suggests the path exists or is protected. "
+                            "Manual verification is required to confirm impact."
+                        ),
+                        validation_limitations=(
+                            "Response body was not analyzed. "
+                            "False positives are possible (e.g. custom 200 pages)."
+                        ),
+                        structured_test_result={
+                            "schema_version": 1,
+                            "method": "scoped_get",
+                            "test_type": "directory_probe",
+                            "observation": f"http_{code}",
+                            "path": path,
+                            "requested_endpoint": url,
+                            "response_origin": "fresh",
+                            "evidence_completeness": "partial",
+                            "not_established": ["content_confirmed", "impact"],
+                        },
+                    )
+            else:
+                # Only print 404s in verbose mode — skip for cleaner output
+                pass
+
+        except requests.RequestException as e:
+            if budget_state is not None and budget_state.get("exhausted"):
+                break
+            # Silently skip connection errors for individual paths
+            pass
+
+    found_count = len(findings)
+    if found_count == 0:
+        print("  No interesting paths found.")
+    else:
+        print(f"  {found_count} interesting path(s) found.")
+
+    return findings
+
 def crawl_local_pages(
     start_url, max_pages=50, response_cache=None, initial_response=None,
     coverage_issues=None,
@@ -1686,6 +1882,29 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
             report.append(f"  {item['header']}: {item['status']}")
             if item.get("value") is not None:
                 report.append(f"    Observed value: {item['value']}")
+        # --- Directory / path discovery (active) ---
+        if active_checks:
+            print()
+            print("Directory Scan (active):")
+            report.append("Directory Scan:")
+            _dir_findings = scan_directories(
+                response.url,
+                enabled=True,
+                budget_state=budget_state,
+            )
+            if _dir_findings:
+                for _df in _dir_findings:
+                    report.append(
+                        f"  [{_df['status']}] {_df['severity']:6s} /{_df['path']}"
+                        + (f"  -> {_df['redirect']}" if _df['redirect'] else "")
+                    )
+            else:
+                report.append("  No interesting paths found.")
+        else:
+            print("Directory Scan: skipped (use --active to enable)")
+            report.append("Directory Scan: skipped; --active opt-in required.")
+        print()
+        report.append("")
 
         report.append("")
         report.append("Note: These are observations only. No vulnerability is automatically confirmed.")
