@@ -1,4 +1,3 @@
-
 from html import unescape
 from html.parser import HTMLParser
 from types import SimpleNamespace
@@ -743,6 +742,438 @@ def check_reflection(url, parameter, enabled=False):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# SSRF probing (active)
+# ---------------------------------------------------------------------------
+
+_SSRF_PAYLOADS = [
+    ("AWS metadata",    "http://169.254.169.254/latest/meta-data/"),
+    ("localhost HTTP",  "http://127.0.0.1/"),
+    ("localhost HTTPS", "https://127.0.0.1/"),
+    ("internal DNS",    "http://internal.invalid/"),
+]
+
+_SSRF_RESPONSE_SIGNALS = [
+    "ami-id", "instance-id", "local-ipv4",
+    "root:x:0:0",
+    "localhost",
+    "127.0.0.1",
+    "169.254.",
+    "<title>",
+]
+
+_SSRF_REDIRECT_PARAM_NAMES = {
+    "url", "uri", "redirect", "redirect_url", "redirect_uri",
+    "next", "return", "returnto", "return_to", "goto", "target",
+    "dest", "destination", "redir", "continue", "forward",
+    "callback", "fetch", "load", "src", "source", "endpoint",
+    "proxy", "request", "path",
+}
+
+
+def check_ssrf(url, parameter, enabled=False):
+    """
+    Probe `parameter` for SSRF by injecting internal/metadata URLs.
+    Only runs when enabled=True (--active opt-in required).
+    Returns True if any signal was observed.
+    """
+    if not enabled:
+        return False
+
+    if parameter.lower() not in _SSRF_REDIRECT_PARAM_NAMES:
+        return False
+
+    safe_parameter = _safe_report_parameter_name(parameter)
+    found = False
+
+    for label, payload in _SSRF_PAYLOADS:
+        parsed_url = urlsplit(url)
+        query_items = parsed_url.query.split("&") if parsed_url.query else []
+        replaced = False
+        updated_items = []
+
+        for item in query_items:
+            name, separator, value = item.partition("=")
+            if name == parameter:
+                updated_items.append(f"{name}={quote(payload, safe='')}")
+                replaced = True
+            else:
+                updated_items.append(item)
+
+        if not replaced:
+            updated_items.append(f"{parameter}={quote(payload, safe='')}")
+
+        request_url = urlunsplit((
+            parsed_url.scheme,
+            parsed_url.netloc,
+            parsed_url.path,
+            "&".join(updated_items),
+            "",
+        ))
+
+        try:
+            response = scoped_get(
+                request_url,
+                timeout=10,
+                allow_redirects=False,
+                headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+            )
+
+            try:
+                location = response.headers.get("Location", "")
+                body_lower = response.text[:4096].lower()
+
+                redirect_hit = (
+                    response.status_code in (301, 302, 303, 307, 308)
+                    and any(
+                        s in location
+                        for s in ("169.254.", "127.0.0.1", "internal.")
+                    )
+                )
+                body_hit = any(s in body_lower for s in _SSRF_RESPONSE_SIGNALS)
+
+                if redirect_hit or body_hit:
+                    signal = (
+                        f"redirect to {location}"
+                        if redirect_hit
+                        else "response body matched internal content signal"
+                    )
+                    print(
+                        f"  [POTENTIAL SSRF] Parameter '{safe_parameter}' "
+                        f"({label}): {signal}"
+                    )
+                    record_candidate(
+                        url,
+                        "SSRF",
+                        "High",
+                        (
+                            f"Parameter '{parameter}' may have caused the server "
+                            f"to fetch an internal resource ({label})."
+                        ),
+                        (
+                            f"Payload: {payload}\n"
+                            f"Test URL: {_render_report_endpoint(request_url)}\n"
+                            f"HTTP status: {response.status_code}\n"
+                            f"Signal: {signal}\n"
+                            "This is a heuristic observation. "
+                            "Confirm by checking whether the server actually "
+                            "fetched the payload URL."
+                        ),
+                        observation_confidence=(
+                            "Heuristic candidate: redirect or body signal observed"
+                        ),
+                        testing_context=(
+                            f"GET parameter: {parameter}; "
+                            f"SSRF payload injected: {payload}; "
+                            "allow_redirects=False."
+                        ),
+                        observed_evidence=(
+                            f"HTTP status: {response.status_code}\n"
+                            f"Location header: {location or 'none'}\n"
+                            f"Body signal: {'yes' if body_hit else 'no'}"
+                        ),
+                        evidence_source="JARVIS active SSRF probe",
+                        evidence_endpoint=response.url,
+                        scanner_interpretation=(
+                            "A redirect to or body content matching an internal "
+                            "address was observed. This does not confirm the "
+                            "server made an outbound request; manual verification "
+                            "is required."
+                        ),
+                        validation_limitations=(
+                            "No out-of-band callback was used. "
+                            "Impact and exploitability were not assessed."
+                        ),
+                        structured_test_result={
+                            "schema_version": 1,
+                            "method": "scoped_get",
+                            "test_type": "ssrf_internal_payload",
+                            "observation": "redirect_or_body_signal",
+                            "payload": payload,
+                            "requested_endpoint": request_url,
+                            "final_response_endpoint": response.url,
+                            "response_origin": "fresh",
+                            "evidence_completeness": "partial",
+                            "not_established": [
+                                "server_side_fetch_confirmed",
+                                "data_exfiltration",
+                                "impact",
+                            ],
+                        },
+                    )
+                    found = True
+                else:
+                    print(
+                        f"  [OK] '{safe_parameter}' — "
+                        f"no SSRF signal for {label} "
+                        f"(status {response.status_code})"
+                    )
+            finally:
+                response.close()
+
+        except requests.RequestException as e:
+            budget = _ACTIVE_AUDIT_REQUEST_BUDGET
+            if budget is not None and budget["exhausted"]:
+                raise
+            print(
+                f"  [ERROR] SSRF probe failed for '{safe_parameter}' "
+                f"({label}): {type(e).__name__}"
+            )
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Open redirect confirmation (active)
+# ---------------------------------------------------------------------------
+
+_OPEN_REDIRECT_CANARY = "https://redirect-canary.jarvis.invalid/"
+
+_OPEN_REDIRECT_PARAM_NAMES = {
+    "url", "uri", "redirect", "redirect_url", "redirect_uri",
+    "next", "return", "returnto", "return_to", "goto", "target",
+    "dest", "destination", "redir", "location", "continue",
+    "forward", "callback",
+}
+
+
+def check_open_redirect(url, parameter, enabled=False):
+    """
+    Confirm whether `parameter` causes an open redirect to an external URL.
+    Only runs when enabled=True (--active opt-in required).
+    Returns True if a redirect to the canary was observed.
+    """
+    if not enabled:
+        return False
+
+    if parameter.lower() not in _OPEN_REDIRECT_PARAM_NAMES:
+        return False
+
+    safe_parameter = _safe_report_parameter_name(parameter)
+
+    parsed_url = urlsplit(url)
+    query_items = parsed_url.query.split("&") if parsed_url.query else []
+    replaced = False
+    updated_items = []
+
+    for item in query_items:
+        name, separator, value = item.partition("=")
+        if name == parameter:
+            updated_items.append(
+                f"{name}={quote(_OPEN_REDIRECT_CANARY, safe='')}"
+            )
+            replaced = True
+        else:
+            updated_items.append(item)
+
+    if not replaced:
+        updated_items.append(
+            f"{parameter}={quote(_OPEN_REDIRECT_CANARY, safe='')}"
+        )
+
+    request_url = urlunsplit((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        parsed_url.path,
+        "&".join(updated_items),
+        "",
+    ))
+
+    try:
+        response = scoped_get(
+            request_url,
+            timeout=10,
+            allow_redirects=False,
+            headers={"User-Agent": "JARVIS-Lab-Assistant/1.0"},
+        )
+
+        try:
+            location = response.headers.get("Location", "")
+            is_redirect = response.status_code in (301, 302, 303, 307, 308)
+            canary_hit  = _OPEN_REDIRECT_CANARY.rstrip("/") in location
+
+            if is_redirect and canary_hit:
+                print(
+                    f"  [OPEN REDIRECT] Parameter '{safe_parameter}' "
+                    f"redirected to canary: {location}"
+                )
+                record_candidate(
+                    url,
+                    "Open Redirect",
+                    "Medium",
+                    (
+                        f"Parameter '{parameter}' caused the server to redirect "
+                        "to an attacker-controlled URL."
+                    ),
+                    (
+                        f"Canary payload: {_OPEN_REDIRECT_CANARY}\n"
+                        f"Test URL: {_render_report_endpoint(request_url)}\n"
+                        f"HTTP status: {response.status_code}\n"
+                        f"Location header: {location}\n"
+                        "The server issued a redirect to the injected external URL."
+                    ),
+                    observation_confidence=(
+                        "Confirmed observation: redirect to canary URL observed"
+                    ),
+                    testing_context=(
+                        f"GET parameter: {parameter}; "
+                        f"canary URL injected: {_OPEN_REDIRECT_CANARY}; "
+                        "allow_redirects=False."
+                    ),
+                    observed_evidence=(
+                        f"HTTP status: {response.status_code}\n"
+                        f"Location header: {location}"
+                    ),
+                    evidence_source="JARVIS active open-redirect probe",
+                    evidence_endpoint=response.url,
+                    scanner_interpretation=(
+                        "The server redirected to the injected canary URL. "
+                        "This is a strong signal of an open redirect. "
+                        "Verify the program considers open redirects in scope."
+                    ),
+                    validation_limitations=(
+                        "The canary domain does not resolve. "
+                        "Phishing or token-theft impact was not demonstrated."
+                    ),
+                    structured_test_result={
+                        "schema_version": 1,
+                        "method": "scoped_get",
+                        "test_type": "open_redirect_canary",
+                        "observation": "redirect_to_canary",
+                        "canary": _OPEN_REDIRECT_CANARY,
+                        "requested_endpoint": request_url,
+                        "final_response_endpoint": response.url,
+                        "response_origin": "fresh",
+                        "evidence_completeness": "complete",
+                        "not_established": ["phishing_impact", "token_theft"],
+                    },
+                )
+                return True
+
+            print(
+                f"  [OK] '{safe_parameter}' — no redirect to canary "
+                f"(status {response.status_code})"
+            )
+            return False
+
+        finally:
+            response.close()
+
+    except requests.RequestException as e:
+        budget = _ACTIVE_AUDIT_REQUEST_BUDGET
+        if budget is not None and budget["exhausted"]:
+            raise
+        print(
+            f"  [ERROR] Open redirect probe failed for "
+            f"'{safe_parameter}': {type(e).__name__}"
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Cookie security checks (passive)
+# ---------------------------------------------------------------------------
+
+def check_cookies(response):
+    """
+    Inspect Set-Cookie headers for missing security flags.
+    Passive — no requests sent.
+    Returns list of result dicts; calls record_candidate for each issue found.
+
+    Missing HttpOnly  -> JS can read the cookie (session hijacking risk)
+    Missing Secure    -> cookie sent over plain HTTP
+    Missing SameSite  -> CSRF risk
+    SameSite=None     -> cross-site requests allowed (check Secure is set too)
+    """
+    results = []
+    cookie_headers = [
+        v for k, v in response.headers.items()
+        if k.lower() == "set-cookie"
+    ]
+
+    if not cookie_headers:
+        return results
+
+    target_url = response.url
+
+    for raw in cookie_headers:
+        parts  = [p.strip() for p in raw.split(";")]
+        name   = parts[0].split("=")[0].strip() if parts else "unknown"
+        flags  = [p.lower() for p in parts[1:]]
+        issues = []
+
+        if not any(f == "httponly" for f in flags):
+            issues.append("Missing HttpOnly flag (JavaScript can read this cookie)")
+
+        if not any(f == "secure" for f in flags):
+            issues.append("Missing Secure flag (cookie transmitted over HTTP)")
+
+        samesite = next((f for f in flags if f.startswith("samesite")), None)
+        if not samesite:
+            issues.append("Missing SameSite attribute (CSRF risk)")
+        elif samesite == "samesite=none":
+            issues.append(
+                "SameSite=None (cross-site requests carry this cookie — "
+                "verify Secure flag is also set)"
+            )
+
+        results.append({
+            "name":   name,
+            "raw":    raw[:200],
+            "issues": issues,
+            "clean":  len(issues) == 0,
+        })
+
+        for issue in issues:
+            safe_name = _safe_report_parameter_name(name)
+            print(f"  [-] Cookie '{safe_name}': {issue}")
+            record_candidate(
+                target_url,
+                "Insecure Cookie Configuration",
+                "Low",
+                f"Cookie '{name}': {issue}",
+                (
+                    f"Cookie name: {name}\n"
+                    f"Issue: {issue}\n"
+                    f"Raw Set-Cookie (truncated): {raw[:200]}\n"
+                    "Missing cookie security flags are accepted findings "
+                    "on many HackerOne programs."
+                ),
+                observation_confidence=(
+                    "Confirmed observation: flag absent from Set-Cookie header"
+                ),
+                testing_context=(
+                    "Passive inspection of Set-Cookie response header; "
+                    "no requests sent."
+                ),
+                observed_evidence=(
+                    f"Set-Cookie header observed:\n{raw[:200]}"
+                ),
+                evidence_source="JARVIS passive cookie flag check",
+                evidence_endpoint=target_url,
+                scanner_interpretation=(
+                    f"{issue}. Confirmed from response header, not a heuristic."
+                ),
+                validation_limitations=(
+                    "Exploitability depends on application context and "
+                    "program scope. Impact was not demonstrated."
+                ),
+                structured_test_result={
+                    "schema_version": 1,
+                    "method": "passive_header_inspection",
+                    "test_type": "cookie_flag_check",
+                    "observation": "missing_flag",
+                    "cookie_name": name,
+                    "issue": issue,
+                    "evidence_completeness": "complete",
+                    "not_established": ["exploitability", "impact"],
+                },
+            )
+
+    return results
+
 def crawl_local_pages(
     start_url, max_pages=50, response_cache=None, initial_response=None,
     coverage_issues=None,
@@ -1175,6 +1606,25 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
         else:
             print("  None")
             report.append("  None")
+        # --- Cookie security checks (passive) ---
+        print("Cookie Security:")
+        report.append("Cookie Security:")
+        _cookie_results = check_cookies(response)
+        if not _cookie_results:
+            print("  No Set-Cookie headers observed.")
+            report.append("  No Set-Cookie headers observed.")
+        else:
+            for _c in _cookie_results:
+                if _c["clean"]:
+                    _cn = _safe_report_parameter_name(_c["name"])
+                    print(f"  [+] Cookie '{_cn}': all flags present")
+                    report.append(f"  [+] Cookie '{_cn}': all flags present")
+                else:
+                    for _issue in _c["issues"]:
+                        _cn = _safe_report_parameter_name(_c["name"])
+                        report.append(f"  [-] Cookie '{_cn}': {_issue}")
+        print()
+        report.append("")
         if active_checks:
             print(f"Active Reflection Checks (request budget: {request_budget}):")
             report.append(
@@ -1183,6 +1633,18 @@ def audit_target(target, active_checks=False, request_budget=DEFAULT_AUDIT_REQUE
             for item in parameters:
                 if item["method"] == "GET":
                     check_reflection(item["url"], item["name"], enabled=True)
+            # --- SSRF probing ---
+            print("Active SSRF Checks:")
+            report.append("Active SSRF Checks:")
+            for _item in parameters:
+                if _item["method"] == "GET":
+                    check_ssrf(_item["url"], _item["name"], enabled=True)
+            # --- Open redirect ---
+            print("Active Open Redirect Checks:")
+            report.append("Active Open Redirect Checks:")
+            for _item in parameters:
+                if _item["method"] == "GET":
+                    check_open_redirect(_item["url"], _item["name"], enabled=True)
         else:
             print("Active Reflection Checks: skipped (explicit --active opt-in required).")
             report.append(
